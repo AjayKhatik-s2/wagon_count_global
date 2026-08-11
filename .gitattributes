@@ -1,0 +1,17 @@
+# Normalize text files in the repository, and guarantee LF in the working
+# tree for files that must run on Linux/EC2 after being committed from
+# Windows.  Without this, setup_ec2.sh cloned from a CRLF checkout fails
+# with: "bash: ./setup_ec2.sh: /usr/bin/env: bad interpreter".
+* text=auto
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf
+*.ipynb text eol=lf
+
+# Runtime assets are binary (normally excluded via .gitignore anyway)
+*.mp4 -text
+*.pt  -text
+*.jpg -text
+*.png -text

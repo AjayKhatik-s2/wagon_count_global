@@ -1,0 +1,150 @@
+# =============================================================================
+# Global Wagon Count -- source repository hygiene
+#
+# Rule of thumb: SOURCE + CONFIG + DOCS + DEPLOY SCRIPTS go into Git.
+# Runtime assets (videos, model weights) and generated artifacts do NOT --
+# they are supplied separately on each machine.  See README.md ->
+# "Runtime assets (videos + model weights)".
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Runtime input videos  (~30-40 MB each, supplied out-of-band)
+# -----------------------------------------------------------------------------
+inputs/*.mp4
+inputs/*.MP4
+inputs/*.avi
+inputs/*.mkv
+inputs/*.mov
+inputs/*.m4v
+inputs/*.webm
+# ...but keep the directory + its instructions in the repo
+!inputs/README.md
+!inputs/.gitkeep
+
+# -----------------------------------------------------------------------------
+# Model weights  (~2-22 MB each, supplied out-of-band)
+# -----------------------------------------------------------------------------
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.engine
+models/*.torchscript
+models/*.tflite
+models/*.weights
+!models/README.md
+!models/.gitkeep
+
+# Ultralytics sometimes auto-downloads a base checkpoint into the CWD
+/yolo*.pt
+/yolov*.pt
+
+# -----------------------------------------------------------------------------
+# Generated output: results/, processed videos, extracted JPEG frames
+# -----------------------------------------------------------------------------
+results/
+outputs/
+processed_videos/
+frames/
+*_processed.mp4
+global_train_state.json
+per_camera_tracking.json
+
+# Extracted frame images anywhere in the tree
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# -----------------------------------------------------------------------------
+# Virtual environments
+# -----------------------------------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.python-version
+
+# -----------------------------------------------------------------------------
+# Environment / secrets
+#
+# NOTE: this project currently requires NO environment variables.  These
+# entries exist so that a future .env can never be committed by accident.
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+.aws/
+
+# -----------------------------------------------------------------------------
+# Logs / temp
+# -----------------------------------------------------------------------------
+*.log
+logs/
+*.tmp
+*.temp
+*.bak
+*.orig
+tmp/
+temp/
+
+# -----------------------------------------------------------------------------
+# Jupyter
+# -----------------------------------------------------------------------------
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+*-checkpoint.ipynb
+
+# -----------------------------------------------------------------------------
+# OS / editor
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
