@@ -340,6 +340,17 @@ def extract_wagon_frames(
 ) -> Dict[str, int]:
     """Write per-wagon frame folders for ONE camera.
 
+    .. deprecated::
+        The Phase-1 pipeline NO LONGER CALLS THIS.  Writing every frame of
+        every wagon produced tens of thousands of JPEGs (1-2 GB per run).
+        ``run_global_count.py`` now builds ``results/combined_report.pdf``
+        via :mod:`evidence_report`, which keeps only four representative
+        frames (20/40/60/80% of each camera's valid evidence interval) per
+        global event and deletes them once the PDF is written.
+
+        The function is retained because it is a valid standalone utility,
+        but calling it will recreate the heavyweight output it replaced.
+
     Output layout:
         {output_root}/{camera_id}/{global_id}/frame_NNNNNN.jpg
 

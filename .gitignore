@@ -39,13 +39,17 @@ models/*.weights
 /yolov*.pt
 
 # -----------------------------------------------------------------------------
-# Generated output: results/, processed videos, extracted JPEG frames
+# Generated output: results/ (combined_report.pdf, JSON contracts), overlay
+# videos, and the temporary evidence frames the report builder creates and
+# then deletes itself.
 # -----------------------------------------------------------------------------
 results/
 outputs/
 processed_videos/
 frames/
+.evidence_tmp/
 *_processed.mp4
+combined_report.pdf
 global_train_state.json
 per_camera_tracking.json
 

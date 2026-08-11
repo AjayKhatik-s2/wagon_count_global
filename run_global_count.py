@@ -39,18 +39,17 @@ WHAT THIS PRODUCES
     results/
         global_train_state.json          <-- canonical Phase-1 output
         per_camera_tracking.json
-        processed_videos/
-            RIGHT_UP_processed.mp4
-            LEFT_UP_processed.mp4
-            RIGHT_UP_TOP_processed.mp4
-            LEFT_UP_TOP_processed.mp4
-        frames/
-            RIGHT_UP/
-                GW_1/  frame_000000.jpg, frame_000001.jpg, ...
-                GW_2/  ...
-            LEFT_UP/   ...
-            RIGHT_UP_TOP/  ...
-            LEFT_UP_TOP/   ...
+        combined_report.pdf              <-- combined evidence report
+
+The report holds, for every global event (GW_n), up to 16 representative
+evidence frames: 20% / 40% / 60% / 80% through each camera's own valid
+evidence interval, for each of RIGHT_UP, LEFT_UP, RIGHT_UP_TOP and
+LEFT_UP_TOP.  Full per-frame sequences are NOT written to disk any more --
+the frames are extracted to a temporary directory and deleted once the PDF
+has been written and verified.
+
+Overlay videos are opt-in (--render-videos) because they are purely visual
+evidence and cost hundreds of MB per run.
 
 WHAT THIS DOES NOT DO
 ---------------------
@@ -83,6 +82,7 @@ from global_train_state import (
 from tracker_engine import GapTracker, MasterClassifier, segments_from_gaps
 import global_alignment as ga
 import video_segmenter as vs
+import evidence_report as er
 
 
 # =============================================================================
@@ -252,10 +252,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fuse-min-conf",    type=float, default=0.4,
                    help="Min mean confidence to insert a fused gap (default: 0.4)")
 
-    p.add_argument("--no-videos", action="store_true", help="Skip overlay video rendering")
-    p.add_argument("--no-frames", action="store_true", help="Skip per-wagon frame extraction")
+    # ---- output / reporting -------------------------------------------------
+    p.add_argument("--render-videos", action="store_true",
+                   help="Also render the per-camera overlay videos into "
+                        "results/processed_videos/ (OFF by default: they are "
+                        "purely visual and cost ~100 MB per camera)")
+    p.add_argument("--no-report", "--no-frames", dest="no_report",
+                   action="store_true",
+                   help="Skip evidence-frame selection and combined_report.pdf")
+    p.add_argument("--report-dpi", type=int, default=er.DEFAULT_REPORT_DPI,
+                   help=f"Raster resolution of the PDF pages "
+                        f"(default: {er.DEFAULT_REPORT_DPI}). Raise for larger "
+                        f"evidence images and a larger PDF.")
+    p.add_argument("--keep-evidence-frames", action="store_true",
+                   help="Keep the temporary evidence JPEGs instead of deleting "
+                        "them after the PDF is written (debugging only)")
+
+    # ---- deprecated, accepted so existing invocations keep working ----------
+    p.add_argument("--no-videos", action="store_true",
+                   help=argparse.SUPPRESS)      # overlay videos are now opt-in
     p.add_argument("--every-nth-frame", type=int, default=1,
-                   help="Keep 1 of every N frames during extraction (default: 1)")
+                   help=argparse.SUPPRESS)      # full sequences are never written
+
     p.add_argument("--no-raw-detections", action="store_true",
                    help="Don't keep raw per-frame detections in memory (saves RAM)")
     p.add_argument("--quiet", action="store_true", help="Reduce log verbosity")
@@ -265,6 +283,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     verbose = not args.quiet
+
+    # Deprecated flags: warn, then ignore. Overlay videos are opt-in now, and
+    # full per-frame sequences are never written, so --every-nth-frame has
+    # nothing left to thin out.
+    if args.no_videos:
+        print("NOTE: --no-videos is deprecated and ignored -- overlay videos are "
+              "already off by default. Use --render-videos to turn them on.",
+              file=sys.stderr)
+    if args.every_nth_frame != 1:
+        print("NOTE: --every-nth-frame is deprecated and ignored -- the pipeline no "
+              "longer writes full frame sequences, only the 20/40/60/80% "
+              "representative evidence frames.", file=sys.stderr)
 
     t_start = time.time()
     print("=" * 70)
@@ -301,10 +331,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print()
 
     os.makedirs(args.output, exist_ok=True)
+    # Only the overlay-video directory is pre-created, and only when asked for.
+    # Evidence frames live in a temporary directory managed by evidence_report.
     processed_videos_dir = os.path.join(args.output, "processed_videos")
-    frames_root = os.path.join(args.output, "frames")
-    os.makedirs(processed_videos_dir, exist_ok=True)
-    os.makedirs(frames_root, exist_ok=True)
+    if args.render_videos:
+        os.makedirs(processed_videos_dir, exist_ok=True)
 
     keep_raw = not args.no_raw_detections
 
@@ -416,12 +447,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[OUTPUT] wrote {tracking_path}")
 
     # ------------------------------------------------------------------
-    # STEP 5 -- overlay videos
+    # STEP 5 -- overlay videos (opt-in: purely visual, ~100 MB per camera)
     # ------------------------------------------------------------------
-    if not args.no_videos:
+    if args.render_videos:
         print()
         print("-" * 70)
-        print("  STEP 5  Overlay videos")
+        print("  STEP 5  Overlay videos  (--render-videos)")
         print("-" * 70)
         for cam in ALL_CAMERAS:
             try:
@@ -438,25 +469,39 @@ def main(argv: Optional[List[str]] = None) -> int:
                 state.add_note(f"render_failed:{cam}:{e}")
 
     # ------------------------------------------------------------------
-    # STEP 6 -- wagon-wise frame extraction
+    # STEP 6 -- combined evidence report
+    #
+    # Replaces the old "write every frame of every wagon" behaviour.  For each
+    # global event produced above, four representative frames (20/40/60/80% of
+    # that camera's own valid evidence interval) are pulled from each of the
+    # four cameras -- at most 16 images per event -- composed into
+    # results/combined_report.pdf, and the temporary JPEGs are then deleted.
+    #
+    # This step only READS `state` and `tracks`.  It cannot influence the
+    # wagon count, the global ids, or any fusion decision.
     # ------------------------------------------------------------------
-    if not args.no_frames:
+    report_info: Optional[Dict[str, object]] = None
+    if not args.no_report:
         print()
         print("-" * 70)
-        print("  STEP 6  Per-wagon frame extraction")
+        print("  STEP 6  Combined evidence report (20/40/60/80% per camera)")
         print("-" * 70)
-        for cam in ALL_CAMERAS:
-            try:
-                vs.extract_wagon_frames(
-                    local_tracks=tracks[cam],
-                    state=state,
-                    output_root=frames_root,
-                    every_nth_frame=args.every_nth_frame,
-                    verbose=verbose,
-                )
-            except Exception as e:
-                print(f"WARNING: frame extraction failed for {cam}: {e}", file=sys.stderr)
-                state.add_note(f"frame_extraction_failed:{cam}:{e}")
+        er.warn_about_legacy_frame_dirs(args.output, verbose=verbose)
+        try:
+            report_info = er.build_combined_report(
+                state=state,
+                tracks=tracks,
+                output_root=args.output,
+                dpi=args.report_dpi,
+                keep_evidence_frames=args.keep_evidence_frames,
+                verbose=verbose,
+            )
+            if not report_info.get("verified"):
+                state.add_note(f"report_unverified:{report_info.get('detail')}")
+        except Exception as e:
+            print(f"WARNING: combined report failed: {e}", file=sys.stderr)
+            traceback.print_exc()
+            state.add_note(f"report_failed:{type(e).__name__}:{e}")
 
     # ------------------------------------------------------------------
     # STEP 7 -- final summary
@@ -466,6 +511,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(summarize_state(state))
     print(f"  total elapsed: {elapsed:.1f}s")
     print(f"  output root  : {os.path.abspath(args.output)}")
+    if report_info:
+        print(f"  report       : {report_info.get('pdf_path')}  "
+              f"({report_info.get('pages')} pages, "
+              f"{report_info.get('slots_available')}/{report_info.get('slots_total')} "
+              f"evidence frames, {report_info.get('detail')})")
+        if report_info.get("frames_cleaned"):
+            print(f"  temp frames  : {report_info.get('frames_cleaned')} "
+                  f"deleted after the PDF was verified")
     print()
 
     # Re-write JSON so any added notes are persisted

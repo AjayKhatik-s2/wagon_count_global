@@ -17,7 +17,8 @@ wagon_count/
 ├── global_train_state.py        # data classes
 ├── tracker_engine.py            # per-camera gap tracking + master classifier
 ├── global_alignment.py          # cross-camera fusion
-├── video_segmenter.py           # overlay + frame extraction
+├── video_segmenter.py           # overlay rendering + frame-range mapping
+├── evidence_report.py           # 20/40/60/80% evidence + combined_report.pdf
 ├── validate_ec2.py              # pre-flight env/asset check (runs no pipeline)
 ├── setup_ec2.sh                 # Ubuntu/EC2 environment bootstrap
 ├── requirements.txt
@@ -102,26 +103,110 @@ After a run:
 
 ```
 results/
+├── combined_report.pdf              ← THE evidence deliverable
 ├── global_train_state.json          ← canonical Phase-1 output
-├── per_camera_tracking.json         ← per-camera gap timelines for debug
-├── processed_videos/
-│   ├── RIGHT_UP_processed.mp4       ← overlay: GW IDs, gaps, classification
-│   ├── LEFT_UP_processed.mp4
-│   ├── RIGHT_UP_TOP_processed.mp4
-│   └── LEFT_UP_TOP_processed.mp4
-└── frames/
-    ├── RIGHT_UP/
-    │   ├── GW_1/frame_000000.jpg, frame_000001.jpg, ...
-    │   ├── GW_2/...
-    │   └── ...
-    ├── LEFT_UP/      (same GW_n layout)
-    ├── RIGHT_UP_TOP/ (same GW_n layout)
-    └── LEFT_UP_TOP/  (same GW_n layout)
+└── per_camera_tracking.json         ← per-camera gap timelines for debug
 ```
+
+That is the whole output. Three files.
 
 All four cameras use the **same** `GW_n` ids — they refer to the same
 physical wagon. This is the contract Phase-2 (door / damage / OCR /
 loaded-empty) will consume.
+
+### `combined_report.pdf` — the evidence report
+
+The pipeline no longer writes one JPEG per frame per wagon per camera
+(which produced tens of thousands of files and 1–2 GB per run). Instead it
+selects a small set of **representative evidence frames** and packages them
+into a single PDF:
+
+* **Page 1 — summary.** Master camera, master FPS, master total frames,
+  final global wagon count, regular / engine / brake-van counts,
+  per-camera local wagon and gap counts with status, the global
+  corrections/insertions table, and the evidence policy. Every value is
+  read straight from the pipeline's own `GlobalTrainState`; nothing is
+  recomputed or invented.
+* **Global wagon roster.** Every `GW_n` with its classification,
+  confidence, master frame range, master time window, duration and how
+  many evidence frames were captured. Paginated for long trains.
+* **One page per global event.** A `4 cameras × 4 percentages` grid — up to
+  **16 evidence images per event** — above a metadata block carrying the
+  global wagon id, wagon index, master frame range, master time window and
+  duration, supporting cameras, and the leading/trailing gap provenance
+  (source, camera, track id, centre time).
+
+Each image is captioned with its camera and percentage, exactly:
+
+```
+RIGHT_UP - 20%      RIGHT_UP - 40%      RIGHT_UP - 60%      RIGHT_UP - 80%
+LEFT_UP - 20%       LEFT_UP - 40%       LEFT_UP - 60%       LEFT_UP - 80%
+RIGHT_UP_TOP - 20%  RIGHT_UP_TOP - 40%  RIGHT_UP_TOP - 60%  RIGHT_UP_TOP - 80%
+LEFT_UP_TOP - 20%   LEFT_UP_TOP - 40%   LEFT_UP_TOP - 60%   LEFT_UP_TOP - 80%
+```
+
+so the same physical event can be compared across all four camera
+perspectives at a glance. Aspect ratio is always preserved — frames are
+scaled, never stretched.
+
+### How the 20 / 40 / 60 / 80 % frames are chosen
+
+The percentages are relative to **that camera's own valid evidence interval
+for that one event** — never to the whole video. The interval is obtained
+from the project's existing mapping,
+`video_segmenter.map_global_wagon_to_local_frames()`, which projects the
+event's master time window onto the camera and clips it to that camera's
+length. This is the same interval the old full-frame extraction walked, so
+no new timing or alignment method was introduced.
+
+Given a valid interval `[start, end]`:
+
+```
+frame(p) = start + round(p/100 × (end − start))       p ∈ {20, 40, 60, 80}
+```
+
+### When there are fewer than 16 images
+
+Missing evidence is reported, never fabricated. A cell shows
+**"No valid evidence available"** plus the reason:
+
+| Situation | What the report shows |
+|---|---|
+| Event lies beyond this camera's video length (the four videos differ in duration) | `event outside this camera's video length` |
+| Camera was not processed in this run | `camera not processed` |
+| Interval shorter than 4 frames | the frame is used **once**, and the duplicate percentages say `interval too short (N frame(s)); 60% resolves to the same frame as 40%` |
+| Frame could not be decoded / written | `frame could not be decoded` |
+
+Partially overlapping events are **not** discarded — the interval is
+clipped to the valid portion and the percentages are computed inside it.
+
+### Temporary frames are deleted
+
+Evidence frames are extracted at full resolution into
+`results/.evidence_tmp/`, composed into the PDF, and **that directory is
+deleted once the PDF has been written and verified** (`%PDF` header and
+`%%EOF` trailer present, non-trivial size). If the PDF fails verification
+the temporary frames are deliberately *kept* so the failure can be
+diagnosed, and the reason is printed. Use `--keep-evidence-frames` to keep
+them on a successful run too.
+
+Temporary filenames are deterministic and collision-free:
+`{CAMERA}__{GW_id}__p{pct}__f{frame:06d}.jpg`.
+
+### Overlay videos are now opt-in
+
+`results/processed_videos/*.mp4` were ~100 MB per camera and purely visual.
+They are **off by default**; pass `--render-videos` if you want them.
+`--no-videos` and `--every-nth-frame` are still accepted but ignored (they
+print a deprecation note), so existing invocations keep working.
+
+If an earlier run left a heavyweight `results/frames/` or
+`results/processed_videos/` behind, the pipeline points it out but **never
+deletes it** — remove it yourself when you are ready:
+
+```bash
+rm -rf results/frames results/processed_videos
+```
 
 `global_train_state.json` shape:
 
@@ -204,11 +289,16 @@ All optional; defaults are usually fine.
 | `--fuse-min-support`         | 2       | Min cameras needed to insert a missed gap    |
 | `--fuse-max-spread`          | 1.5     | Max time spread (s) inside a fusion cluster  |
 | `--fuse-min-conf`            | 0.4     | Min mean confidence to insert a fused gap    |
-| `--every-nth-frame`          | 1       | Keep 1 of every N frames when extracting     |
-| `--no-videos`                | off     | Skip overlay video rendering                 |
-| `--no-frames`                | off     | Skip per-wagon frame extraction              |
+| `--render-videos`            | off     | Also render the overlay MP4s (~100 MB/camera) |
+| `--no-report`                | off     | Skip evidence selection + `combined_report.pdf` |
+| `--report-dpi`               | 150     | PDF page raster resolution; raise for bigger evidence images |
+| `--keep-evidence-frames`     | off     | Keep the temporary evidence JPEGs (debugging) |
 | `--no-raw-detections`        | off     | Save RAM by not storing per-frame bboxes     |
 | `--quiet`                    | off     | Reduce log verbosity                         |
+
+Deprecated but still accepted (ignored, with a note): `--no-videos`
+(overlays are already off), `--every-nth-frame` (no full sequences are
+written any more), and `--no-frames` (kept as an alias for `--no-report`).
 
 ---
 
@@ -352,9 +442,10 @@ Recommended instance:
 | CPU only | `t3.xlarge` (4 vCPU, 16 GB) | 60 GB gp3 | works; slowest |
 | GPU      | `g4dn.xlarge` (T4, 16 GB) | 60 GB gp3 | markedly faster inference |
 
-AMI: **Ubuntu Server 22.04 or 24.04 LTS**. Size the disk generously — a full
-run writes overlay videos plus one JPEG per frame per camera, which is
-**1–2 GB of output per train pass**.
+AMI: **Ubuntu Server 22.04 or 24.04 LTS**. 30 GB gp3 is ample for the code,
+the virtualenv (torch is ~2.5 GB) and the runtime assets; a run's output is
+only the JSON contracts plus a few-MB `combined_report.pdf`. Give it 60 GB if
+you plan to use `--render-videos`, which adds ~100 MB per camera per run.
 
 ```bash
 ssh -i /path/to/key.pem ubuntu@<EC2_PUBLIC_IP>
@@ -418,18 +509,20 @@ python run_global_count.py 2>&1 | tee run.log
 # detach: Ctrl-b then d      reattach: tmux attach -t wagon
 ```
 
-Faster / lighter variants (all optional, algorithm unchanged):
+Optional variants (all optional, algorithm unchanged):
 
 ```bash
-python run_global_count.py --no-frames                 # skip JPEG extraction
-python run_global_count.py --no-videos                 # skip overlay rendering
-python run_global_count.py --every-nth-frame 5         # 1 JPEG in 5
+python run_global_count.py --no-report                 # skip combined_report.pdf
+python run_global_count.py --render-videos             # also write overlay MP4s
+python run_global_count.py --report-dpi 300            # larger evidence images
+python run_global_count.py --keep-evidence-frames      # keep the temp JPEGs
 python run_global_count.py --no-raw-detections         # lower RAM
-python run_global_count.py -o /mnt/data/results        # output to a bigger volume
+python run_global_count.py -o /mnt/data/results        # output to another volume
 ```
 
-Results land in `results/` — see *Outputs* above. The headline number is
-`total_wagons` in `results/global_train_state.json`:
+Results land in `results/` — see *Outputs* above. The evidence deliverable is
+`results/combined_report.pdf`; the headline number is `total_wagons` in
+`results/global_train_state.json`:
 
 ```bash
 python -c "import json;d=json.load(open('results/global_train_state.json'));print('wagons:',d['total_wagons'],'fallback:',d['fallback_used'])"
@@ -529,6 +622,17 @@ separately, exactly as in the Git workflow above.
 ## Phase-2 hook
 
 The Phase-2 pipeline (door state, damage, OCR, loaded/empty, report)
-will consume `results/frames/<CAMERA>/<GW_n>/` directly. Same GW ids
-across cameras mean each downstream feature extractor can correlate
+consumes `results/global_train_state.json` — the canonical machine-readable
+contract. For every `GW_n` it carries the master frame range and master time
+window, so a downstream feature extractor can pull exactly the frames it
+needs straight from the source videos using the same projection this project
+uses (`video_segmenter.map_global_wagon_to_local_frames()`).
+
+Same GW ids across cameras mean each downstream extractor can correlate
 findings without re-running synchronization.
+
+> Phase 1 no longer persists `results/frames/<CAMERA>/<GW_n>/` frame
+> folders. They cost 1–2 GB per run, and the evidence they carried is now
+> summarised in `combined_report.pdf`. A consumer that genuinely needs full
+> frame sequences should derive them on demand from the JSON contract rather
+> than have Phase 1 write them for every run.

@@ -17,8 +17,13 @@
       every wagon has a single authoritative classification:
           ENGINE | WAGON | BRAKE_VAN
       the SAME GW_n across all 4 cameras refers to the SAME physical wagon
-      the per-wagon frame folders downstream phases will consume are written
-      to disk under  results/frames/{CAMERA}/{GW_n}/
+      a single combined evidence report is written to
+          results/combined_report.pdf
+      holding, per global event, up to 16 representative frames
+          (20% / 40% / 60% / 80%  x  RIGHT_UP / LEFT_UP / RIGHT_UP_TOP /
+           LEFT_UP_TOP)
+      and the machine-readable contract downstream phases consume stays
+          results/global_train_state.json
 
   RIGHT_UP is the MASTER CAMERA.  Its gap detections and classifications
   are authoritative.  The other 3 cameras only contribute *temporal
@@ -113,9 +118,26 @@
   │                          │   CYAN raw YOLO detections on top +       │
   │                          │   MAGENTA wagon-boundary flash +          │
   │                          │   info panel (camera, GW_n, class, conf). │
+  │                          │ map_global_wagon_to_local_frames()        │
+  │                          │   master time window -> local frame range │
+  │                          │   (the evidence interval; reused by       │
+  │                          │    evidence_report.py)                    │
   │                          │ extract_wagon_frames()                    │
-  │                          │   writes JPEG per frame into              │
+  │                          │   DEPRECATED / NO LONGER CALLED --         │
+  │                          │   wrote one JPEG per frame into           │
   │                          │   output/{CAMERA}/{GW_n}/                 │
+  ├──────────────────────────┼───────────────────────────────────────────┤
+  │ evidence_report.py       │ select_event_evidence()                   │
+  │                          │   picks the 20/40/60/80% frame of each    │
+  │                          │   camera's own interval per event         │
+  │                          │ extract_evidence_frames()                 │
+  │                          │   one grab/retrieve pass per camera into  │
+  │                          │   results/.evidence_tmp/                  │
+  │                          │ build_combined_report()                   │
+  │                          │   composes results/combined_report.pdf    │
+  │                          │   (summary + roster + one 4x4 page per    │
+  │                          │    event), verifies it, then deletes the  │
+  │                          │   temporary frames                        │
   ├──────────────────────────┼───────────────────────────────────────────┤
   │ global_train_state.py    │ Canonical dataclasses:                    │
   │                          │   GapEvent, LocalCameraTracks,            │
@@ -438,6 +460,11 @@
   STEP 6 — OVERLAY VIDEOS   (video_segmenter.render_processed_video)
 ================================================================================
 
+  OPT-IN.  Disabled by default -- pass --render-videos to enable.  The
+  overlay MP4s are purely visual evidence and cost roughly 100 MB per
+  camera per run; the combined PDF report (step 7) is the default evidence
+  deliverable instead.
+
   One pass per camera.  For each frame:
 
       1) MAGENTA top/bottom flash for ±3 frames around any projected
@@ -480,46 +507,107 @@
 
 
 ================================================================================
-  STEP 7 — PER-WAGON FRAME EXTRACTION   (video_segmenter.extract_wagon_frames)
+  STEP 7 — COMBINED EVIDENCE REPORT   (evidence_report.build_combined_report)
 ================================================================================
 
-  This is the foundation that Phase-2+ feature extractors will consume.
+  REPLACES the former per-wagon full-frame extraction.  Writing every frame
+  of every wagon for every camera produced tens of thousands of JPEGs and
+  1-2 GB per run.  Phase 1 now keeps only FOUR REPRESENTATIVE FRAMES per
+  camera per event and packages them into ONE PDF.
 
-  For each camera:
+  This step is purely a CONSUMER of the finished GlobalTrainState and the
+  per-camera LocalCameraTracks.  It performs no detection, no tracking, no
+  alignment, no fusion and no counting, and it cannot change the wagon
+  count, the global ids, or any fusion decision.
 
-      1) Build  cam_wagon_ranges = {GW_n: (start_local, end_local)}
-         where local frame range comes from
+  A) EVIDENCE INTERVAL  (unchanged projection)
+
+      For each global event GW_n and each camera, the valid evidence
+      interval is obtained from the SAME existing mapping the old
+      extraction used --  video_segmenter.map_global_wagon_to_local_frames:
+
             start_local = round(GW.start_time * cam.fps)
             end_local   = round(GW.end_time   * cam.fps) - 1
          clipped into [0, cam.total_frames - 1].
 
-      2) Walk the video frame-by-frame.  If frame_idx falls inside
-         exactly one GW's range AND (frame_idx % every_nth_frame == 0)
-         write the frame to:
-            results/frames/<CAMERA>/<GW_n>/frame_<NNNNNN>.jpg
-         at JPEG quality 90.
+      No new timing or alignment method is introduced.
 
-      3) Print per-wagon counts at end of camera pass.
+      Before sampling, the UNCLAMPED projection is checked for overlap with
+      the camera.  If the event lies entirely outside the camera's video
+      (the four videos differ in length), the camera is honestly reported
+      as having no evidence instead of being clamped to a meaningless
+      single edge frame.  Partial overlap IS used -- clipped to the valid
+      portion.
 
-  Result layout:
+  B) REPRESENTATIVE FRAME SELECTION  (20 / 40 / 60 / 80 %)
 
-      results/frames/
-          RIGHT_UP/
-              GW_1/  frame_000000.jpg, frame_000001.jpg, ...
-              GW_2/  ...
-              ...
-          LEFT_UP/      (same GW_n layout)
-          RIGHT_UP_TOP/ (same GW_n layout)
-          LEFT_UP_TOP/  (same GW_n layout)
+      Percentages are relative to THAT camera's own interval for THAT
+      event -- never to the whole video:
+
+            frame(p) = start_local + round(p/100 * (end_local - start_local))
+            for p in {20, 40, 60, 80}
+
+      Short intervals are never padded with fabricated duplicates.  If two
+      percentages resolve to the same frame, the frame is used ONCE and the
+      duplicate percentage is reported as unavailable with the reason.
+      A 1-frame interval therefore yields exactly 1 evidence image.
+
+  C) EXTRACTION
+
+      One sequential decode pass per camera: cap.grab() to skip cheaply,
+      cap.retrieve() only on wanted frames.  No seeking, deterministic.
+      Frames are written at ORIGINAL resolution (JPEG q92) into
+
+            results/.evidence_tmp/{CAMERA}__{GW_id}__p{pct}__f{frame:06d}.jpg
+
+      Deterministic and collision-free across events and cameras.
+
+  D) PDF COMPOSITION  ->  results/combined_report.pdf
+
+      Page 1        summary: master camera / fps / total frames, final
+                    wagon count, regular/engine/brake-van counts,
+                    per-camera local wagon + gap counts + status,
+                    corrections/insertions table, evidence policy.
+                    All values read from GlobalTrainState.to_dict().
+      Roster page(s) every GW_n with classification, confidence, master
+                    frame range, master time window, duration, evidence
+                    coverage.  Paginated for long trains.
+      Per event     one page: 4 cameras (rows) x 4 percentages (columns),
+                    i.e. UP TO 16 EVIDENCE IMAGES PER EVENT, over a
+                    metadata block (global id, wagon index, master frames,
+                    master time + duration, supporting cameras,
+                    leading/trailing gap provenance, split_from id).
+
+      Every image is captioned  "<CAMERA> - <PCT>%"  e.g. "RIGHT_UP - 20%",
+      "LEFT_UP_TOP - 80%".  Aspect ratio is always preserved (scaled,
+      never stretched).  Cells with no valid evidence render a
+      "No valid evidence available" placeholder plus the reason.
+
+      Written with Pillow (already an ultralytics dependency) so the pages
+      are JPEG-compressed inside the PDF -- a few MB instead of the
+      hundreds of MB a Flate/vector writer would produce.  Fully headless:
+      no GUI, no cv2.imshow, no display required.
+
+  E) VERIFY, THEN CLEAN UP
+
+      The PDF is checked for a %PDF header, a %%EOF trailer and a
+      non-trivial size.  ONLY on success is results/.evidence_tmp/ deleted.
+      On failure the temporary frames are kept for diagnosis and the reason
+      is printed.
 
   CONSISTENCY GUARANTEE:
-      RIGHT_UP/GW_17  LEFT_UP/GW_17  RIGHT_UP_TOP/GW_17  LEFT_UP_TOP/GW_17
-      all hold frames of the SAME PHYSICAL WAGON.
-      This is the input contract Phase-2 consumes.
+      GW_17 on all four camera rows of its page is the SAME PHYSICAL WAGON.
+      The machine-readable contract Phase-2 consumes remains
+      results/global_train_state.json.
 
   Tuning knobs:
-      --every-nth-frame  default 1  (1 = keep every frame, 5 = sparser)
-      --no-frames        skip this step entirely
+      --no-report             skip this step entirely (alias: --no-frames)
+      --report-dpi     150    page raster resolution; raise for bigger images
+      --keep-evidence-frames  keep the temporary JPEGs after a successful PDF
+
+  DEPRECATED (accepted, ignored, prints a note):
+      --every-nth-frame       nothing writes full frame sequences any more
+      --no-videos             overlay videos are already off by default
 
 
 ================================================================================
@@ -613,7 +701,7 @@
    │                 │                                                │
    │                 ▼                                                │
    │   ┌───────────────────────────────────────────────────────┐    │
-   │   │  STEP 6  overlay videos (one per camera)              │    │
+   │   │  STEP 6  overlay videos  -- OPT-IN (--render-videos)  │    │
    │   │    YELLOW tracked-gap bbox (interpolated, continuous) │    │
    │   │    CYAN  raw YOLO bbox (per frame, when present)      │    │
    │   │    MAGENTA wagon-boundary flash                       │    │
@@ -622,8 +710,13 @@
    │                 │                                                │
    │                 ▼                                                │
    │   ┌───────────────────────────────────────────────────────┐    │
-   │   │  STEP 7  per-wagon JPEG extraction (one per camera)   │    │
-   │   │  results/frames/{CAMERA}/{GW_n}/frame_NNNNNN.jpg      │    │
+   │   │  STEP 7  combined evidence report                     │    │
+   │   │    select 20/40/60/80% of each camera's own interval  │    │
+   │   │    extract -> results/.evidence_tmp/  (temporary)     │    │
+   │   │    compose  -> results/combined_report.pdf            │    │
+   │   │      summary + roster + one 4 cameras x 4 pct page    │    │
+   │   │      per event  (up to 16 images per event)           │    │
+   │   │    verify the PDF, THEN delete .evidence_tmp/         │    │
    │   └─────────────┬─────────────────────────────────────────┘    │
    │                 │                                                │
    │                 ▼                                                │
@@ -709,11 +802,17 @@
   │ --fuse-max-spread                │ 1.5s     │ cluster + match win   │
   │ --fuse-min-conf                  │ 0.4      │ min cluster mean conf │
   ├──────────────────────────────────┼──────────┼───────────────────────┤
-  │ --every-nth-frame                │ 1        │ frame extraction      │
-  │ --no-videos                      │ off      │ skip step 6           │
-  │ --no-frames                      │ off      │ skip step 7           │
+  │ --render-videos                  │ off      │ enable step 6         │
+  │ --no-report                      │ off      │ skip step 7           │
+  │ --report-dpi                     │ 150      │ PDF page resolution   │
+  │ --keep-evidence-frames           │ off      │ keep temp JPEGs       │
   │ --no-raw-detections              │ off      │ save RAM, no cyan box │
   │ --quiet                          │ off      │ less stdout           │
+  ├──────────────────────────────────┼──────────┼───────────────────────┤
+  │ DEPRECATED (accepted, ignored, prints a note):                      │
+  │ --no-videos                      │ off      │ step 6 already off    │
+  │ --every-nth-frame                │ 1        │ no full sequences now │
+  │ --no-frames                      │ off      │ alias of --no-report  │
   └──────────────────────────────────┴──────────┴───────────────────────┘
 
   In-tracker defaults (not yet exposed as CLI flags — edit
@@ -755,13 +854,26 @@
 
   Phase-2 (door state, damage, OCR, loaded/empty, report) MUST consume:
 
-      results/global_train_state.json
-      results/frames/<CAMERA>/<GW_n>/*.jpg
+      results/global_train_state.json      <- the canonical contract
 
   and MUST NOT re-run wagon counting or classification.  The same GW_n
   across cameras refers to the same physical wagon by construction —
   any Phase-2 feature extractor can attach its output to that GW_n
   directly without further alignment.
+
+  results/frames/<CAMERA>/<GW_n>/*.jpg is NO LONGER PRODUCED.  Phase 1 used
+  to persist every frame of every wagon (1-2 GB per run); the visual
+  evidence now lives in results/combined_report.pdf as up to 16
+  representative frames per event.
+
+  Each GW_n entry in global_train_state.json still carries
+  start_frame_master / end_frame_master and start_time / end_time, so a
+  Phase-2 extractor that needs full frame sequences can derive them on
+  demand from the source videos using the SAME projection this project uses:
+
+      video_segmenter.map_global_wagon_to_local_frames(wagon, fps, total)
+
+  which is exactly what evidence_report.py calls to build its intervals.
 
 
 ================================================================================
