@@ -303,6 +303,43 @@ class GlobalTrainState:
     # Free-form notes from the runner
     notes: List[str] = field(default_factory=list)
 
+    # -------------------------------------------------------------------------
+    # Fixed-master fusion block (global_fusion.py).  All fields are additive and
+    # default to empty, so consumers written against the original schema keep
+    # working unchanged.
+    #
+    # The distinction these fields exist to make explicit:
+    #   global_gaps[i]["master_*"]              -> THE master gap (authoritative)
+    #   global_gaps[i]["support_observations"]  -> evidence children of that gap
+    #   global_gaps[i]["missing_cameras"]       -> in range, did not observe it
+    #   global_gaps[i]["unavailable_cameras"]   -> no footage / unresolved offset
+    #   extra_support_observations              -> support detections matching NO
+    #                                              global gap.  Diagnostic only:
+    #                                              they never become global gaps.
+    # -------------------------------------------------------------------------
+    fusion_mode: str = ""
+    """'master-fixed' (RIGHT_UP authoritative) or 'legacy' (pre-existing path)."""
+
+    global_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    """The authoritative global gap sequence. Under master-fixed fusion this has
+    exactly len(RIGHT_UP gaps) entries, each with a RIGHT_UP source."""
+
+    camera_offsets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    """Per-camera t_global = t_local + delta, with RESOLVED/UNRESOLVED status.
+    Used for evidence association only -- never for counting."""
+
+    support_alignment_summary: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    """Per support camera: MATCH / MISSING / EXTRA counts and alignment cost."""
+
+    extra_support_observations: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    """Support detections that correspond to no global gap. Diagnostics only."""
+
+    interval_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    """Suspicious wagon intervals (report only; the master sequence is final)."""
+
+    invariant_checks: Dict[str, Any] = field(default_factory=dict)
+    """Machine-readable result of the fixed-master invariant assertions."""
+
     def add_note(self, text: str) -> None:
         self.notes.append(text)
 
@@ -337,6 +374,18 @@ class GlobalTrainState:
             "fallback_used": self.fallback_used,
             "fallback_reason": self.fallback_reason,
             "notes": list(self.notes),
+            # ---- fixed-master fusion block (empty under legacy fusion) ----
+            "fusion_mode": self.fusion_mode,
+            "right_up_final_gap_count": self.invariant_checks.get(
+                "right_up_final_gap_count", self.per_camera_gap_counts.get(
+                    self.master_camera)),
+            "global_gap_count": len(self.global_gaps) or None,
+            "invariant_checks": dict(self.invariant_checks),
+            "camera_offsets": dict(self.camera_offsets),
+            "support_alignment_summary": dict(self.support_alignment_summary),
+            "interval_diagnostics": list(self.interval_diagnostics),
+            "extra_support_observations": dict(self.extra_support_observations),
+            "global_gaps": list(self.global_gaps),
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -364,6 +413,44 @@ def summarize_state(state: GlobalTrainState) -> str:
         st = state.per_camera_status.get(cam, "—")
         lines.append(f"    {cam:<14}  wagons={wc}   gaps={gc}   [{st}]")
     lines.append("")
+    if state.fusion_mode == "master-fixed":
+        chk = state.invariant_checks or {}
+        lines.append("  Fusion mode          : master-fixed "
+                     "(RIGHT_UP gaps are complete and final)")
+        lines.append(f"  RIGHT_UP final gaps  : {chk.get('right_up_final_gap_count', '—')}")
+        lines.append(f"  GLOBAL gaps          : {chk.get('global_gap_count', '—')}"
+                     f"   [invariant {'OK' if chk.get('invariant_holds') else 'VIOLATED'}]")
+        if chk.get("collapsed_boundaries"):
+            lines.append(f"  collapsed boundaries : {chk['collapsed_boundaries']} "
+                         f"(two gaps rounded to the same master frame)")
+        for cam in ALL_CAMERAS:
+            if cam == state.master_camera:
+                continue
+            off = state.camera_offsets.get(cam)
+            al = state.support_alignment_summary.get(cam)
+            if not off:
+                continue
+            if off.get("status") == "RESOLVED":
+                lines.append(f"    {cam:<14} delta={off['delta']:+7.2f}s  "
+                             f"MATCH={al['n_match'] if al else '—'}  "
+                             f"MISSING={al['n_missing'] if al else '—'}  "
+                             f"EXTRA={al['n_extra'] if al else '—'}")
+            else:
+                lines.append(f"    {cam:<14} offset {off.get('status')} "
+                             f"-> no evidence contributed (count unaffected)")
+        n_extra = sum(len(v) for v in state.extra_support_observations.values())
+        lines.append(f"  EXTRA support obs    : {n_extra} "
+                     f"(diagnostic only; created 0 global gaps)")
+        if state.interval_diagnostics:
+            n_short = sum(1 for d in state.interval_diagnostics
+                          if d.get("flag") == "SUSPICIOUSLY_SHORT")
+            n_long = sum(1 for d in state.interval_diagnostics
+                         if d.get("flag") == "POSSIBLE_MISSING_GAP")
+            lines.append(f"  Interval diagnostics : {n_short} suspiciously short, "
+                         f"{n_long} possibly-missing gap(s)")
+            lines.append("                         (REPORT ONLY -- the RIGHT_UP "
+                         "sequence was not modified)")
+        lines.append("")
     lines.append(f"  Corrections applied  : {len(state.corrections_applied)}")
     for c in state.corrections_applied:
         lines.append(

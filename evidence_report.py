@@ -43,6 +43,7 @@ display -- there is no cv2.imshow and no GUI backend.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import time
@@ -177,13 +178,32 @@ def _percentage_frame(start: int, end: int, percentage: int) -> int:
 def select_event_evidence(
     state: GlobalTrainState,
     tracks: Dict[str, LocalCameraTracks],
+    camera_offsets: Optional[Dict[str, float]] = None,
+    unresolved_cameras: Optional[Dict[str, str]] = None,
 ) -> List[EventEvidence]:
     """Plan the evidence frames for every global event, for every camera.
 
     Reads the event list straight from ``state.wagons`` -- the global ids and
-    time windows the existing fusion logic produced.  Nothing is recomputed.
+    time windows the fusion stage produced.  Nothing is recomputed and no wagon
+    is ever added or removed here: the number of report pages always follows the
+    global wagon roster.
+
+    Parameters
+    ----------
+    camera_offsets :
+        Optional per-camera clock offset in seconds (``t_global = t_local +
+        delta``).  When supplied, a global wagon's master time window is shifted
+        into each camera's own clock before projection, so the sampled frames
+        show the same physical wagon in every camera.  Omitting it reproduces the
+        historical behaviour (all cameras assumed to share t=0).
+    unresolved_cameras :
+        Cameras whose offset could not be resolved, mapped to the reason.  Their
+        evidence is reported as unavailable rather than sampled at a guessed
+        offset.
     """
     events: List[EventEvidence] = []
+    camera_offsets = camera_offsets or {}
+    unresolved_cameras = unresolved_cameras or {}
 
     for wagon in state.wagons:
         ev = EventEvidence(wagon=wagon)
@@ -191,6 +211,16 @@ def select_event_evidence(
         for cam in ALL_CAMERAS:
             tr = tracks.get(cam)
             ce = CameraEvidence(camera_id=cam)
+
+            if cam in unresolved_cameras:
+                ce.note = unresolved_cameras[cam]
+                ce.slots = [
+                    EvidenceSlot(cam, wagon.global_id, p, available=False,
+                                 reason="camera offset unresolved")
+                    for p in EVIDENCE_PERCENTAGES
+                ]
+                ev.cameras[cam] = ce
+                continue
 
             if tr is None:
                 ce.note = "camera was not processed in this run"
@@ -212,16 +242,23 @@ def select_event_evidence(
                 ev.cameras[cam] = ce
                 continue
 
-            # Does this event's master time window overlap this camera at all?
+            # Shift the event's master time window into THIS camera's clock.
+            # delta == 0.0 reproduces the historical shared-t=0 assumption.
+            delta = float(camera_offsets.get(cam, 0.0))
+            local_start_time = wagon.start_time - delta
+            local_end_time = wagon.end_time - delta
+
+            # Does this event's window overlap this camera at all?
             # The unclamped projection tells us honestly; the clamped interval
             # (from the project's existing mapping function) is what we sample.
             cam_duration = tr.total_frames / tr.fps
-            raw_start = int(round(wagon.start_time * tr.fps))
-            raw_end = int(round(wagon.end_time * tr.fps)) - 1
+            raw_start = int(round(local_start_time * tr.fps))
+            raw_end = int(round(local_end_time * tr.fps)) - 1
             if raw_end < 0 or raw_start > tr.total_frames - 1:
                 ce.note = (f"event window {wagon.start_time:.2f}-{wagon.end_time:.2f}s "
-                           f"lies outside this camera's {cam_duration:.2f}s of video "
-                           f"(synchronization boundary)")
+                           f"(local {local_start_time:.2f}-{local_end_time:.2f}s at "
+                           f"delta={delta:+.2f}s) lies outside this camera's "
+                           f"{cam_duration:.2f}s of video")
                 ce.slots = [
                     EvidenceSlot(cam, wagon.global_id, p, available=False,
                                  reason="event outside this camera's video length")
@@ -231,7 +268,9 @@ def select_event_evidence(
                 continue
 
             sf, ef = map_global_wagon_to_local_frames(
-                wagon, tr.fps, tr.total_frames,
+                dataclasses.replace(wagon, start_time=local_start_time,
+                                    end_time=local_end_time) if delta else wagon,
+                tr.fps, tr.total_frames,
             )
             if ef < sf:
                 ce.note = "no valid frame range for this event"
@@ -1063,6 +1102,26 @@ def warn_about_legacy_frame_dirs(output_root: str, verbose: bool = True) -> None
 # PUBLIC ENTRY POINT
 # =============================================================================
 
+def camera_offsets_from_state(
+    state: GlobalTrainState,
+) -> Tuple[Dict[str, float], Dict[str, str]]:
+    """Split ``state.camera_offsets`` into usable deltas and unresolved reasons.
+
+    An unresolved camera is never sampled at a guessed offset; its evidence is
+    reported as unavailable instead.
+    """
+    deltas: Dict[str, float] = {}
+    unresolved: Dict[str, str] = {}
+    for cam, off in (getattr(state, "camera_offsets", None) or {}).items():
+        status = off.get("status")
+        if status in ("REFERENCE", "RESOLVED"):
+            deltas[cam] = float(off.get("delta", 0.0))
+        else:
+            unresolved[cam] = (off.get("reason")
+                               or f"camera offset {status or 'unknown'}")
+    return deltas, unresolved
+
+
 def build_combined_report(
     *,
     state: GlobalTrainState,
@@ -1071,8 +1130,14 @@ def build_combined_report(
     dpi: int = DEFAULT_REPORT_DPI,
     keep_evidence_frames: bool = False,
     verbose: bool = True,
+    use_camera_offsets: bool = True,
 ) -> Dict[str, Any]:
     """Select evidence, build ``combined_report.pdf``, clean up temp frames.
+
+    Strictly downstream of counting: this runs after the global train state is
+    final, only reads it, and produces exactly one page per global wagon plus the
+    summary and roster.  Extra support-camera detections cannot add pages, and
+    nothing here can create or renumber a GW id.
 
     Returns a summary dict:
         pdf_path, pages, events, slots_available, slots_total,
@@ -1093,7 +1158,18 @@ def build_combined_report(
         cleanup_temp_evidence(temp_dir, verbose=False)
 
     # ---- select ----
-    events = select_event_evidence(state, tracks)
+    deltas, unresolved = ({}, {})
+    if use_camera_offsets:
+        deltas, unresolved = camera_offsets_from_state(state)
+        if verbose and deltas:
+            shown = ", ".join(f"{c}{d:+.2f}s" for c, d in sorted(deltas.items()) if d)
+            if shown:
+                print(f"  [EVIDENCE] applying camera clock offsets: {shown}")
+        if verbose and unresolved:
+            print(f"  [EVIDENCE] offset unresolved for {', '.join(sorted(unresolved))} "
+                  f"-> their evidence is reported unavailable, not guessed")
+    events = select_event_evidence(state, tracks, camera_offsets=deltas,
+                                  unresolved_cameras=unresolved)
     result["slots_total"] = sum(e.total_slots for e in events)
     if verbose:
         planned = sum(1 for e in events for s in e.slots if s.available)

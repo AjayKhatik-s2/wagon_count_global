@@ -81,6 +81,7 @@ from global_train_state import (
 )
 from tracker_engine import GapTracker, MasterClassifier, segments_from_gaps
 import global_alignment as ga
+import global_fusion as gf
 import video_segmenter as vs
 import evidence_report as er
 
@@ -245,12 +246,41 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--classification-samples", type=int, default=5,
                    help="Frames per segment for side_classification.pt vote (default: 5)")
 
+    # ---- fusion ------------------------------------------------------------
+    p.add_argument("--fusion", choices=("master-fixed", "legacy"),
+                   default="master-fixed",
+                   help="Fusion architecture. 'master-fixed' (default) treats the "
+                        "RIGHT_UP gap sequence as complete and final: global gaps "
+                        "== RIGHT_UP gaps, and support cameras contribute evidence "
+                        "only. 'legacy' is the previous behaviour, in which support "
+                        "cameras could insert extra global gaps (kept for A/B "
+                        "comparison only).")
+    p.add_argument("--fusion-non-strict", action="store_true",
+                   help="Downgrade fixed-master invariant violations from an error "
+                        "to a warning (field diagnosis only)")
+    p.add_argument("--offset-search", type=float, default=gf.DEFAULT_CONFIG.offset_search_s,
+                   help=f"Half-range in seconds of the camera time-offset search "
+                        f"(default: {gf.DEFAULT_CONFIG.offset_search_s})")
+    p.add_argument("--offset-min-margin", type=float,
+                   default=gf.DEFAULT_CONFIG.offset_min_margin_ratio,
+                   help=f"Relative score margin a candidate offset must beat its "
+                        f"nearest rival by to be accepted; below this the camera is "
+                        f"marked UNRESOLVED and contributes no evidence "
+                        f"(default: {gf.DEFAULT_CONFIG.offset_min_margin_ratio})")
+    p.add_argument("--match-tolerance", type=float,
+                   default=gf.DEFAULT_CONFIG.match_tolerance_s,
+                   help=f"Timing tolerance in seconds used when associating a "
+                        f"support observation with a RIGHT_UP gap "
+                        f"(default: {gf.DEFAULT_CONFIG.match_tolerance_s})")
+
+    # ---- deprecated: the insertion mechanism these controlled no longer -----
+    # ---- exists in master-fixed fusion. Still parsed by 'legacy'. ----------
     p.add_argument("--fuse-min-support", type=int, default=2,
-                   help="Min supporting cameras for inserting a missed gap (default: 2)")
+                   help=argparse.SUPPRESS)
     p.add_argument("--fuse-max-spread",  type=float, default=1.5,
-                   help="Max time spread within a fusion cluster (default: 1.5s)")
+                   help=argparse.SUPPRESS)
     p.add_argument("--fuse-min-conf",    type=float, default=0.4,
-                   help="Min mean confidence to insert a fused gap (default: 0.4)")
+                   help=argparse.SUPPRESS)
 
     # ---- output / reporting -------------------------------------------------
     p.add_argument("--render-videos", action="store_true",
@@ -280,6 +310,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _resolved_camera_offsets(state: GlobalTrainState) -> Dict[str, float]:
+    """Per-camera clock offset, but ONLY where synchronization was decisive.
+
+    An UNRESOLVED camera maps to 0.0 and is therefore treated exactly as it was
+    before offsets existed -- never forced to a guessed value.
+    """
+    out: Dict[str, float] = {}
+    for cam, off in (state.camera_offsets or {}).items():
+        if off.get("status") in ("REFERENCE", "RESOLVED"):
+            out[cam] = float(off.get("delta", 0.0))
+    return out
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     verbose = not args.quiet
@@ -295,6 +338,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("NOTE: --every-nth-frame is deprecated and ignored -- the pipeline no "
               "longer writes full frame sequences, only the 20/40/60/80% "
               "representative evidence frames.", file=sys.stderr)
+    if args.fusion == "master-fixed":
+        for flag, val, default in (("--fuse-min-support", args.fuse_min_support, 2),
+                                   ("--fuse-max-spread", args.fuse_max_spread, 1.5),
+                                   ("--fuse-min-conf", args.fuse_min_conf, 0.4)):
+            if val != default:
+                print(f"NOTE: {flag} is ignored under --fusion master-fixed -- there "
+                      f"is no support-camera insertion mechanism to tune. RIGHT_UP "
+                      f"gaps are complete and final.", file=sys.stderr)
 
     t_start = time.time()
     print("=" * 70)
@@ -406,23 +457,49 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ------------------------------------------------------------------
     print()
     print("-" * 70)
-    print("  STEP 3  Cross-camera gap fusion")
+    if args.fusion == "master-fixed":
+        print("  STEP 3  Cross-camera alignment  (master-fixed: RIGHT_UP is final)")
+    else:
+        print("  STEP 3  Cross-camera gap fusion  (LEGACY: support cameras may insert)")
     print("-" * 70)
     support = [tracks[c] for c in ALL_CAMERAS if c != CAMERA_RIGHT_UP]
-    fuse_cfg = dict(ga.PHASE1_DEFAULTS)
-    fuse_cfg.update({
-        "insert_min_support": int(args.fuse_min_support),
-        "insert_max_spread_sec": float(args.fuse_max_spread),
-        "insert_min_confidence": float(args.fuse_min_conf),
-    })
 
-    state: GlobalTrainState = ga.assemble_global_train_state(
-        master_tracks=master,
-        support_tracks=support,
-        initial_classifications=initial_classifications,
-        config=fuse_cfg,
-        verbose=verbose,
-    )
+    if args.fusion == "master-fixed":
+        # The global gap sequence IS the RIGHT_UP gap sequence. Support cameras
+        # are aligned to it to attach evidence; they cannot create, delete,
+        # split or merge a global gap, so the count is independent of both the
+        # support detections and the camera-offset estimation.
+        fusion_cfg = gf.FusionConfig(
+            offset_search_s=float(args.offset_search),
+            offset_min_margin_ratio=float(args.offset_min_margin),
+            match_tolerance_s=float(args.match_tolerance),
+            strict_invariants=not args.fusion_non_strict,
+        )
+        state: GlobalTrainState = gf.assemble_global_train_state_master_fixed(
+            master_tracks=master,
+            support_tracks=support,
+            initial_classifications=initial_classifications,
+            config=fusion_cfg,
+            verbose=verbose,
+        )
+    else:
+        print("WARNING: --fusion legacy allows support-camera observations to "
+              "insert global gaps, which breaks the RIGHT_UP-is-final invariant. "
+              "Use it only to reproduce old results.", file=sys.stderr)
+        fuse_cfg = dict(ga.PHASE1_DEFAULTS)
+        fuse_cfg.update({
+            "insert_min_support": int(args.fuse_min_support),
+            "insert_max_spread_sec": float(args.fuse_max_spread),
+            "insert_min_confidence": float(args.fuse_min_conf),
+        })
+        state = ga.assemble_global_train_state(
+            master_tracks=master,
+            support_tracks=support,
+            initial_classifications=initial_classifications,
+            config=fuse_cfg,
+            verbose=verbose,
+        )
+        state.fusion_mode = "legacy"
 
     # ------------------------------------------------------------------
     # STEP 4 -- write JSON
@@ -454,6 +531,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("-" * 70)
         print("  STEP 5  Overlay videos  (--render-videos)")
         print("-" * 70)
+        # Under master-fixed fusion each camera's estimated clock offset is used
+        # so the projected global boundaries land on the right local frames, and
+        # wagons outside a camera's footage are not drawn at all. Videos are
+        # visualization only: they use the same GW ids as combined_report.pdf and
+        # cannot change the count.
+        offsets = _resolved_camera_offsets(state)
         for cam in ALL_CAMERAS:
             try:
                 out_mp4 = os.path.join(processed_videos_dir, f"{cam}_processed.mp4")
@@ -463,6 +546,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     output_path=out_mp4,
                     draw_raw_detections=keep_raw,
                     verbose=verbose,
+                    time_offset=offsets.get(cam, 0.0),
+                    drop_out_of_range=(state.fusion_mode == "master-fixed"),
                 )
             except Exception as e:
                 print(f"WARNING: render failed for {cam}: {e}", file=sys.stderr)

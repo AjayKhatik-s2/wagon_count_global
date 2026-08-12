@@ -29,7 +29,7 @@ Frame range derivation for non-master cameras:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Dict, Optional, Tuple
 
 import cv2
@@ -90,13 +90,40 @@ def map_global_wagon_to_local_frames(
 def build_camera_wagon_frame_map(
     state: GlobalTrainState,
     local_tracks: LocalCameraTracks,
+    time_offset: float = 0.0,
+    drop_out_of_range: bool = False,
 ) -> Dict[str, Tuple[int, int]]:
-    """For a given camera, map each global_id -> (start_frame, end_frame)."""
+    """For a given camera, map each global_id -> (start_frame, end_frame).
+
+    Parameters
+    ----------
+    time_offset :
+        The camera's estimated clock offset in seconds (``t_global =
+        t_local + delta``), so a global wagon window is projected onto the
+        camera's own footage rather than assuming all four videos share t=0.
+        The default 0.0 reproduces the historical behaviour exactly.
+    drop_out_of_range :
+        When True, wagons whose window falls entirely outside this camera's
+        footage are OMITTED from the map instead of being clamped to the last
+        frame. Clamping is what fabricates evidence at the end of a shorter
+        video, so callers that must not fabricate should pass True.
+    """
     out: Dict[str, Tuple[int, int]] = {}
+    fps = local_tracks.fps
+    total = local_tracks.total_frames
     for w in state.wagons:
-        out[w.global_id] = map_global_wagon_to_local_frames(
-            w, local_tracks.fps, local_tracks.total_frames,
-        )
+        if drop_out_of_range and fps > 0 and total > 0:
+            # Unclamped projection first: does this wagon overlap the footage?
+            raw_s = int(round((w.start_time - time_offset) * fps))
+            raw_e = int(round((w.end_time - time_offset) * fps)) - 1
+            if raw_e < 0 or raw_s > total - 1:
+                continue
+        if time_offset:
+            shifted = replace(w, start_time=w.start_time - time_offset,
+                              end_time=w.end_time - time_offset)
+        else:
+            shifted = w
+        out[w.global_id] = map_global_wagon_to_local_frames(shifted, fps, total)
     return out
 
 
@@ -169,10 +196,27 @@ def render_processed_video(
     output_path: str,
     draw_raw_detections: bool = True,
     verbose: bool = True,
+    time_offset: float = 0.0,
+    drop_out_of_range: bool = False,
 ) -> str:
     """Render the overlay video for ONE camera.
 
     Returns the output path.  Creates parent directory if needed.
+
+    Visualization only: this function never creates, deletes or renumbers a
+    global wagon.  It draws the global structure it is given, so the video and
+    ``combined_report.pdf`` always show the same GW ids.
+
+    Parameters
+    ----------
+    time_offset :
+        This camera's estimated clock offset (seconds).  Passing the value
+        estimated by ``global_fusion`` makes the projected global wagon
+        boundaries land on the correct local frames instead of assuming a shared
+        t=0.  Default 0.0 = historical behaviour.
+    drop_out_of_range :
+        When True, global wagons outside this camera's footage are not drawn at
+        all rather than being clamped onto the final frame.
     """
     if local_tracks.fps <= 0:
         raise ValueError(f"Cannot render: invalid fps for {local_tracks.camera_id}")
@@ -202,7 +246,10 @@ def render_processed_video(
             frame_to_active_gap[f] = g
 
     # Per-camera global_id -> [start_local_frame, end_local_frame]
-    wagon_ranges = build_camera_wagon_frame_map(state, local_tracks)
+    wagon_ranges = build_camera_wagon_frame_map(
+        state, local_tracks, time_offset=time_offset,
+        drop_out_of_range=drop_out_of_range,
+    )
 
     # Build a frame_idx -> GlobalWagon map for fast lookup, AND a list of
     # boundary frames at which to draw the magenta line.
@@ -212,6 +259,8 @@ def render_processed_video(
     frame_to_wagon: Dict[int, GlobalWagon] = {}
     boundary_frames: List[int] = []
     for w in state.wagons:
+        if w.global_id not in wagon_ranges:
+            continue           # outside this camera's footage: draw nothing
         sf, ef = wagon_ranges[w.global_id]
         for f in range(sf, ef + 1):
             frame_to_wagon[f] = w
@@ -378,6 +427,8 @@ def extract_wagon_frames(
     frame_to_target: Dict[int, Tuple[str, str]] = {}
     counts: Dict[str, int] = {}
     for w in state.wagons:
+        if w.global_id not in wagon_ranges:
+            continue
         sf, ef = wagon_ranges[w.global_id]
         wdir = os.path.join(cam_root, w.global_id)
         os.makedirs(wdir, exist_ok=True)
