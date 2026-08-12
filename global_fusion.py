@@ -312,11 +312,43 @@ class SupportAlignment:
     total_cost: float = 0.0
     status: str = "ok"
 
+    # ---- observation bookkeeping ------------------------------------------
+    # These record the CANONICAL counts around the alignment call, so the
+    # invariant can be checked against the exact sequence the DP was given
+    # rather than against a pre-filter count.
+    raw_observation_count: int = 0
+    """Observations this camera produced BEFORE any pre-alignment filtering
+    (i.e. its validated gap events)."""
+
+    aligned_observation_count: int = 0
+    """Observations actually passed to `align_to_master` -- that is, after
+    classification / wagon-window / outside-wagon-region filtering. This is the
+    number MATCH + EXTRA must equal."""
+
+    @property
+    def excluded_observation_count(self) -> int:
+        """raw - aligned: observations removed before alignment ran."""
+        return max(0, self.raw_observation_count - self.aligned_observation_count)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "camera_id": self.camera_id,
             "status": self.status,
             "offset": self.offset.to_dict(),
+            # ---- observation bookkeeping: raw = aligned + excluded, and
+            # ---- aligned = MATCH + EXTRA
+            "raw_observations": self.raw_observation_count,
+            "excluded_outside_wagon_region": self.excluded_observation_count,
+            "aligned_observations": self.aligned_observation_count,
+            "MATCH": len(self.matches),
+            "MISSING": len(self.missing_global_gap_ids),
+            "EXTRA": len(self.extra_observations),
+            "bookkeeping_balances": (
+                len(self.matches) + len(self.extra_observations)
+                == self.aligned_observation_count
+                and self.aligned_observation_count + self.excluded_observation_count
+                == self.raw_observation_count),
+            # legacy key names, retained so existing consumers keep working
             "n_match": len(self.matches),
             "n_missing": len(self.missing_global_gap_ids),
             "n_extra": len(self.extra_observations),
@@ -787,11 +819,15 @@ def attach_support_evidence(
     for st in support_tracks:
         cam = st.camera_id
         try:
-            sup_obs = to_gap_observations(st)
+            all_obs = to_gap_observations(st)
+            n_raw = len(all_obs)
 
             # Keep engine / brake-van observations out of wagon synchronization.
+            # `sup_obs` from here on IS the canonical sequence given to the DP --
+            # every count reported or asserted downstream derives from it, never
+            # from the pre-filter list.
             sup_obs, non_wagon_obs = filter_observations_to_wagon_region(
-                sup_obs, wagon_regions.get(cam))
+                all_obs, wagon_regions.get(cam))
             if non_wagon_obs and verbose:
                 print(f"  [FUSE/{cam}] {len(non_wagon_obs)} observation(s) lie "
                       f"outside this camera's wagon region -> excluded from wagon "
@@ -802,7 +838,9 @@ def attach_support_evidence(
                                    reason=REASON_NO_METADATA)
                 alignments[cam] = SupportAlignment(
                     camera_id=cam, offset=off, status="no-metadata",
-                    non_wagon_observations=list(non_wagon_obs))
+                    non_wagon_observations=list(non_wagon_obs),
+                    raw_observation_count=n_raw,
+                    aligned_observation_count=0)   # alignment never ran
                 for g in global_gaps:
                     g.unavailable_cameras[cam] = REASON_NO_METADATA
                 continue
@@ -815,6 +853,8 @@ def attach_support_evidence(
                     camera_id=cam, offset=off, status="offset-unresolved",
                     extra_observations=_with_offset(sup_obs, 0.0),
                     non_wagon_observations=list(non_wagon_obs),
+                    raw_observation_count=n_raw,
+                    aligned_observation_count=len(sup_obs),
                 )
                 for g in global_gaps:
                     g.unavailable_cameras[cam] = REASON_OFFSET_UNRESOLVED
@@ -827,7 +867,12 @@ def attach_support_evidence(
             cost, pairs, missing_idx, extra_idx = align_to_master(
                 master_obs, shifted, cfg)
 
-            al = SupportAlignment(camera_id=cam, offset=off, total_cost=cost)
+            al = SupportAlignment(
+                camera_id=cam, offset=off, total_cost=cost,
+                raw_observation_count=n_raw,
+                # `shifted` is literally the list align_to_master received.
+                aligned_observation_count=len(shifted),
+            )
             for mi, sj in pairs:
                 gap = global_gaps[mi]
                 obs = shifted[sj]
@@ -847,9 +892,14 @@ def attach_support_evidence(
 
             if verbose:
                 print(f"  [FUSE/{cam}] delta={off.delta:+.2f}s ({off.status})  "
-                      f"MATCH={len(al.matches)}  MISSING={len(al.missing_global_gap_ids)}  "
+                      f"raw={al.raw_observation_count} "
+                      f"excluded={al.excluded_observation_count} "
+                      f"aligned={al.aligned_observation_count}  ->  "
+                      f"MATCH={len(al.matches)}  "
+                      f"MISSING={len(al.missing_global_gap_ids)}  "
                       f"EXTRA={len(al.extra_observations)}  "
-                      f"(EXTRA create no global gaps)")
+                      f"(MATCH+EXTRA={len(al.matches) + len(al.extra_observations)}"
+                      f"=aligned; EXTRA create no global gaps)")
 
         except Exception as e:                      # pragma: no cover - safety net
             off = CameraOffset(camera_id=cam, status=OFFSET_UNRESOLVED,
@@ -1018,19 +1068,59 @@ def assert_invariants(
     if collapsed < 0:
         problems.append(f"negative collapsed-boundary count ({collapsed})")
 
-    # 9/10. each support observation is exactly one of MATCH / MISSING / EXTRA
+    # 9/10. Every observation ACTUALLY ALIGNED is exactly one of MATCH or EXTRA.
+    #
+    # The comparison is against `aligned_observation_count` -- the length of the
+    # very list handed to align_to_master -- NOT against the camera's raw
+    # validated gap count. Observations removed before alignment (engine /
+    # brake-van region, wagon-window and any other explicit pre-alignment
+    # filtering) are accounted for separately by check 10b, so nothing is lost:
+    #
+    #     raw = aligned + excluded          (10b)
+    #     aligned = MATCH + EXTRA           (9)
+    #
+    # Comparing MATCH+EXTRA against `raw` was a bookkeeping error: a camera with
+    # 59 validated gaps, 2 of them outside its wagon region, feeds 57 to the DP,
+    # so MATCH(46) + EXTRA(11) = 57 is correct and must not be reported as a
+    # violation.
     for st in support_tracks:
         al = alignments.get(st.camera_id)
         if al is None:
             continue
-        n_obs = len(st.gaps)
-        if al.offset.usable:
+
+        # 9. MATCH + EXTRA must account for exactly the aligned sequence.
+        # Applies whenever the DP ran; 'no-metadata' / 'error' never reach it.
+        if al.status in ("ok", "offset-unresolved"):
             accounted = len(al.matches) + len(al.extra_observations)
-            if accounted != n_obs:
+            if accounted != al.aligned_observation_count:
                 problems.append(
                     f"{st.camera_id}: MATCH({len(al.matches)}) + "
                     f"EXTRA({len(al.extra_observations)}) = {accounted} != "
-                    f"{n_obs} observations")
+                    f"{al.aligned_observation_count} aligned observations "
+                    f"(raw={al.raw_observation_count}, "
+                    f"excluded={al.excluded_observation_count})")
+
+        # 10b. The exclusion bookkeeping must itself balance.
+        if al.raw_observation_count:
+            if al.raw_observation_count != len(st.gaps):
+                problems.append(
+                    f"{st.camera_id}: raw_observation_count="
+                    f"{al.raw_observation_count} != {len(st.gaps)} validated gaps")
+            if (al.aligned_observation_count + al.excluded_observation_count
+                    != al.raw_observation_count):
+                problems.append(
+                    f"{st.camera_id}: aligned({al.aligned_observation_count}) + "
+                    f"excluded({al.excluded_observation_count}) != "
+                    f"raw({al.raw_observation_count})")
+            if al.status in ("ok", "offset-unresolved"):
+                if al.excluded_observation_count != len(al.non_wagon_observations):
+                    problems.append(
+                        f"{st.camera_id}: excluded count "
+                        f"{al.excluded_observation_count} != "
+                        f"{len(al.non_wagon_observations)} recorded excluded "
+                        f"observations -- an exclusion was not reported")
+
+        # A support camera can never out-match the global sequence.
         if len(al.matches) > len(global_gaps):
             problems.append(f"{st.camera_id}: more matches than global gaps")
         matched_ids = sorted(al.matches.keys())

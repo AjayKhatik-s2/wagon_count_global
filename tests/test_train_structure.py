@@ -277,6 +277,96 @@ class TestSupportCannotInflate(unittest.TestCase):
         self.assertEqual(st.invariant_checks["master_wagon_count"], 6)
         self.assertTrue(st.invariant_checks["invariant_holds"])
 
+    def test_observation_bookkeeping_balances_after_region_filtering(self):
+        """Regression: the EC2 run reported a false invariant violation because
+        MATCH+EXTRA was compared against the RAW observation count instead of the
+        post-filter count actually given to the DP.
+
+        Reproduces the shape of that run: a support camera with the same number
+        of observations as the master, two of which fall outside its wagon
+        region, so 2 fewer reach alignment.
+
+            raw = aligned + excluded
+            aligned = MATCH + EXTRA
+        """
+        n = 20
+        master, cls = segments_and_labels([E] + [W] * (n - 1))
+        base = [g.center_time for g in master.gaps]
+        sup = make_tracks(CAMERA_RIGHT_UP_TOP, base)
+        # Region starts after the first two observations -> exactly 2 excluded.
+        region = ts.LocalWagonRegion(
+            camera_id=CAMERA_RIGHT_UP_TOP, found=True,
+            start_time=base[2] - 0.05, end_time=base[-1] + 5.0)
+
+        st = gf.assemble_global_train_state_master_fixed(
+            master_tracks=master, support_tracks=[sup],
+            initial_classifications=cls, config=gf.FusionConfig(), verbose=False,
+            wagon_regions={CAMERA_RIGHT_UP_TOP: region})
+
+        # The invariant must HOLD -- this is the bug being regression-tested.
+        self.assertTrue(st.invariant_checks["invariant_holds"],
+                        st.invariant_checks["violations"])
+
+        s = st.support_alignment_summary[CAMERA_RIGHT_UP_TOP]
+        self.assertEqual(s["raw_observations"], len(sup.gaps))
+        self.assertEqual(s["excluded_outside_wagon_region"], 2)
+        self.assertEqual(s["aligned_observations"], len(sup.gaps) - 2)
+        self.assertEqual(s["MATCH"] + s["EXTRA"], s["aligned_observations"],
+                         "MATCH + EXTRA must equal the ALIGNED count")
+        self.assertEqual(s["aligned_observations"]
+                         + s["excluded_outside_wagon_region"],
+                         s["raw_observations"])
+        self.assertTrue(s["bookkeeping_balances"])
+        # and the master invariant is untouched by any of it
+        self.assertEqual(st.invariant_checks["global_gap_count"], len(master.gaps))
+
+    def test_bookkeeping_balances_with_no_filtering(self):
+        """With no region filter, excluded is 0 and raw == aligned."""
+        master, cls = segments_and_labels([E, W, W, W, W, B])
+        sup = make_tracks(CAMERA_LEFT_UP, [g.center_time for g in master.gaps])
+        st = assemble(master, [sup], cls)
+        s = st.support_alignment_summary[CAMERA_LEFT_UP]
+        self.assertEqual(s["excluded_outside_wagon_region"], 0)
+        self.assertEqual(s["raw_observations"], s["aligned_observations"])
+        self.assertEqual(s["MATCH"] + s["EXTRA"], s["aligned_observations"])
+        self.assertTrue(st.invariant_checks["invariant_holds"])
+
+    def test_bookkeeping_balances_when_offset_unresolved(self):
+        """An unresolved camera still balances: every aligned obs is EXTRA."""
+        master, cls = segments_and_labels([E, W, W, W, W, W, W, B])
+        base = [g.center_time for g in master.gaps]
+        sup = make_tracks(CAMERA_LEFT_UP_TOP, base)
+        region = ts.LocalWagonRegion(
+            camera_id=CAMERA_LEFT_UP_TOP, found=True,
+            start_time=base[1] - 0.05, end_time=base[-1] + 5.0)
+        st = gf.assemble_global_train_state_master_fixed(
+            master_tracks=master, support_tracks=[sup],
+            initial_classifications=cls,
+            config=gf.FusionConfig(offset_min_match_fraction=1.5),  # force UNRESOLVED
+            verbose=False, wagon_regions={CAMERA_LEFT_UP_TOP: region})
+        s = st.support_alignment_summary[CAMERA_LEFT_UP_TOP]
+        self.assertEqual(s["offset"]["status"], gf.OFFSET_UNRESOLVED)
+        self.assertEqual(s["excluded_outside_wagon_region"], 1)
+        self.assertEqual(s["MATCH"], 0)
+        self.assertEqual(s["MATCH"] + s["EXTRA"], s["aligned_observations"])
+        self.assertTrue(s["bookkeeping_balances"])
+        self.assertTrue(st.invariant_checks["invariant_holds"])
+
+    def test_a_genuine_accounting_error_is_still_caught(self):
+        """The invariant must not have been weakened: corrupting the alignment
+        bookkeeping still fails loudly."""
+        master, cls = segments_and_labels([E, W, W, W, B])
+        sup = make_tracks(CAMERA_LEFT_UP, [g.center_time for g in master.gaps])
+        gaps = gf.build_global_gap_sequence(master)
+        aligns = gf.attach_support_evidence(gaps, [sup], gf.FusionConfig(),
+                                           verbose=False)
+        al = aligns[CAMERA_LEFT_UP]
+        al.extra_observations.append(al.matches[list(al.matches)[0]])  # phantom EXTRA
+        with self.assertRaises(gf.FusionInvariantError):
+            gf.assert_invariants(
+                global_gaps=gaps, master_tracks=master, wagons=[],
+                alignments=aligns, support_tracks=[sup], strict=True)
+
     def test_support_observations_outside_the_wagon_region_are_excluded(self):
         master, cls = segments_and_labels([E, W, W, W, B])
         base = [g.center_time for g in master.gaps]
