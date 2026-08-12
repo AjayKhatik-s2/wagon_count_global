@@ -505,10 +505,36 @@ def summarize_state(state: GlobalTrainState) -> str:
             f"conf={c.mean_confidence:.2f}  spread={c.time_spread_sec:.2f}s"
         )
     lines.append("")
-    lines.append(f"  FINAL FUSED WAGON COUNT : {state.total_wagons}")
-    lines.append(f"     regular wagons       : {state.regular_wagon_count}")
-    lines.append(f"     engines              : {state.engine_count}")
-    lines.append(f"     brake vans           : {state.brake_van_count}")
+    if state.wagon_window:
+        ww = state.wagon_window
+        lines.append("  TRAIN STRUCTURE (only WAGONs are counted):")
+        lines.append(f"     leading non-wagon    : "
+                     f"{ww.get('leading_non_wagon_classes') or 'none'}")
+        lines.append(f"     WAGON region         : "
+                     f"{ww.get('first_wagon') or '-'} .. {ww.get('last_wagon') or '-'}"
+                     f"   frames {ww.get('wagon_start_frame')}-"
+                     f"{ww.get('wagon_end_frame')}")
+        lines.append(f"     trailing non-wagon   : "
+                     f"{ww.get('trailing_non_wagon_classes') or 'none'}")
+        if ww.get("interior_non_wagon_count"):
+            lines.append(f"     excluded inside      : "
+                         f"{ww.get('interior_non_wagon_classes')}")
+        lines.append("     (ENGINE / BRAKE_VAN are preserved above but never "
+                     "receive a GW id)")
+        lines.append("")
+    lines.append(f"  FINAL GLOBAL WAGON COUNT : {state.total_wagons}")
+    if state.wagon_window:
+        lines.append(f"     GW ids               : GW_1 .. GW_{state.total_wagons}")
+        lines.append(f"     classified WAGON     : {state.regular_wagon_count}")
+        unknown_in = (state.total_wagons - state.regular_wagon_count
+                      - state.engine_count - state.brake_van_count)
+        if unknown_in:
+            lines.append(f"     unlabelled (counted) : {unknown_in}  "
+                         f"(between two wagons, so physically a vehicle)")
+    else:
+        lines.append(f"     regular wagons       : {state.regular_wagon_count}")
+        lines.append(f"     engines              : {state.engine_count}")
+        lines.append(f"     brake vans           : {state.brake_van_count}")
     if state.fallback_used:
         lines.append(f"  ⚠ FALLBACK USED       : {state.fallback_reason}")
     lines.append("=" * 70)
