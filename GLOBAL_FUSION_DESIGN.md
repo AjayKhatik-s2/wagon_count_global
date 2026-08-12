@@ -9,11 +9,38 @@ Companion documents: `CURRENT_FUSION_ANALYSIS.md` (Phase 1, what was wrong),
 
 | | |
 |---|---|
-| New module | `global_fusion.py` |
-| New tests | `tests/test_global_fusion.py` — **31 tests, all passing** |
-| Modified | `run_global_count.py`, `global_train_state.py`, `video_segmenter.py`, `evidence_report.py` |
+| New modules | `global_fusion.py`, `gap_validation.py`, `train_structure.py` |
+| New tests | `tests/` — **92 tests, all passing** (fusion 31, gap validation 27, train structure 34) |
+| Modified | `run_global_count.py`, `global_train_state.py`, `video_segmenter.py`, `evidence_report.py`, `validate_ec2.py` |
 | Unchanged | `tracker_engine.py` (verified byte-identical), `global_alignment.build_global_wagons` (reused as-is) |
 | Default fusion | `--fusion master-fixed`; `--fusion legacy` retained for A/B only |
+
+### The counting chain, as built
+
+```
+raw YOLO gap detections        (candidates only)
+        |   tracker_engine.GapTracker  -- UNCHANGED
+tracked gap candidates
+        |   gap_validation.validate_gap_events        <-- NEW
+valid gap events               (motion / persistence / trajectory / duplicates)
+        |   build_global_wagons  -- REUSED UNCHANGED
+segments + classification
+        |   train_structure.get_master_wagon_window   <-- NEW
+WAGON WINDOW: first WAGON .. last WAGON
+        |
+GW_1 .. GW_N                   == total_wagons == master_wagon_count
+```
+
+Two invariants now hold together:
+
+```
+global_gaps  == validated RIGHT_UP gaps          (fixed-master)
+total_wagons == WAGON units of the wagon window  (wagon-only)
+```
+
+ENGINE and BRAKE_VAN are preserved in `wagon_window`, the PDF's train-structure
+block and the overlay videos, but never receive a GW id and never extend the
+wagon timeline. Assertion 13/14 fails loudly if one ever does.
 
 ### Measured result on the real dataset
 

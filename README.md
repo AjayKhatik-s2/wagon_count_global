@@ -28,11 +28,12 @@ wagon_count/
 │   ├── left_up.mp4
 │   ├── right_up_top.mp4
 │   └── left_up_top.mp4
-├── models/                      # drop the 4 YOLO weights here
+├── models/                      # drop the YOLO weights here
 │   ├── right_up_wagon_gap.pt    # RIGHT_UP (master) gap model
 │   ├── left_up_wagon_gap.pt     # LEFT_UP gap model
 │   ├── top_gap.pt               # top cameras (RIGHT_UP_TOP, LEFT_UP_TOP)
-│   └── side_classification.pt   # RIGHT_UP only: ENGINE / WAGON / BRAKE_VAN
+│   ├── side_classification.pt   # RIGHT_UP + LEFT_UP: ENGINE / WAGON / BRAKE_VAN
+│   └── top_classification.pt    # RIGHT_UP_TOP + LEFT_UP_TOP (optional)
 └── results/                     # created on first run
 ```
 
@@ -113,6 +114,87 @@ That is the whole output. Three files.
 All four cameras use the **same** `GW_n` ids — they refer to the same
 physical wagon. This is the contract Phase-2 (door / damage / OCR /
 loaded-empty) will consume.
+
+### What gets counted
+
+```
+                RIGHT_UP  (master, the only counting authority)
+                    |
+   raw YOLO gap detections   -- candidates only
+                    |
+   temporal tracking          (existing Kalman tracker, unchanged)
+                    |
+   gap validation             motion / persistence / trajectory / duplicates
+                    |
+   valid gap events  ->  segments  ->  classification
+                    |
+   WAGON WINDOW:  first WAGON .. last WAGON
+                    |
+                GW_1 .. GW_N          <-- the wagon count
+```
+
+Two rules govern the number:
+
+1. **Only wagons are counted.** `ENGINE` and `BRAKE_VAN` are real train objects,
+   are kept in the JSON, the PDF and the overlay videos, and are visible in the
+   train-structure summary — but they never receive a `GW_n` id and never extend
+   the wagon timeline. `ENGINE + 3 WAGON + BRAKE_VAN` yields `GW_1 GW_2 GW_3`,
+   not five ids. Use `--no-wagon-only` to count every segment (A/B comparison).
+2. **A raw YOLO gap is a candidate, not a boundary.** The train moves, so a real
+   inter-wagon gap sweeps across the image. A detection pinned to one pixel
+   column is background — measured on this project's own footage, three such
+   artefacts had confidence 0.93 and were detected on every one of 30 frames, so
+   confidence and persistence alone cannot reject them. See *Gap validation*.
+
+`total_wagons == master_wagon_count`, always. Support cameras contribute
+evidence, synchronization and diagnostics; they can never change the number.
+
+### Gap validation
+
+Detection and tracking are unchanged: the existing YOLO models, confidence
+thresholds, Kalman parameters and association gates are all untouched. What is
+new is a deterministic validation layer between the tracker and fusion, which
+reads the motion the tracker already recorded on every `GapEvent`
+(`center_x_trajectory`, `hit_frames`, `bbox_history`) and applies eight
+independent tests:
+
+| Test | Rejection reason |
+|---|---|
+| track extent, hit count | `REJECTED_TOO_SHORT` |
+| blind runs, coverage | `REJECTED_DETECTION_GAP` |
+| mean track confidence | `REJECTED_LOW_CONFIDENCE` |
+| pinned centre | `REJECTED_STATIC` |
+| insufficient displacement | `REJECTED_LOW_MOTION` |
+| apparent speed out of band | `REJECTED_IMPLAUSIBLE_SPEED` |
+| direction flips | `REJECTED_INCONSISTENT_TRAJECTORY` |
+| against the camera's flow | `REJECTED_WRONG_DIRECTION` |
+| far from the camera's median speed | `REJECTED_TRAIN_MOTION_MISMATCH` |
+| same physical gap tracked twice | `REJECTED_DUPLICATE` |
+
+Nothing is discarded silently: every rejection is written to
+`global_train_state.json` with its reason **and** its measured features, so the
+chain `raw detections → tracked candidates → valid gap events` is auditable per
+camera.
+
+Thresholds were set from measurement, not guesswork. Running the existing tracker
+over the first 1500 frames of three cameras gave:
+
+| Camera | tracks | \|displacement\| px (min/med/max) | speed px/s | monotonic | coverage |
+|---|---|---|---|---|---|
+| RIGHT_UP | 16 | 401 / 468 / 547 | 317 / 470 / 554 | 1.00 | 1.00 |
+| RIGHT_UP_TOP | 18 | 111 / 340 / 614 | 74 / 387 / 546 | ≥0.61 | ≥0.58 |
+| LEFT_UP_TOP | 8 | 0 / 248 / 354 | 0 / 237 / 356 | ≥0.52 | ≥0.43 |
+
+The three zero-displacement LEFT_UP_TOP tracks are genuine false positives —
+**confidence 0.93, 30 hits each, coverage 1.00**, centres pinned at x=436, x=487
+and x=283. Confidence, hit-count and coverage filters all pass them; only motion
+rejects them. Gap direction is also per-camera (RIGHT_UP moves −x, LEFT_UP_TOP
+moves +x), so the dominant direction is derived from each camera's own tracks
+rather than assumed.
+
+Every default therefore has a measured margin: `--gap-static-max-px 4.0` against
+a smallest real displacement of 110.7 px, and `--gap-min-motion-px 12.0` a ~9×
+margin. All are CLI-configurable and recorded in the output JSON.
 
 ### `combined_report.pdf` — the evidence report
 
@@ -289,6 +371,18 @@ All optional; defaults are usually fine.
 | `--fuse-min-support`         | 2       | Min cameras needed to insert a missed gap    |
 | `--fuse-max-spread`          | 1.5     | Max time spread (s) inside a fusion cluster  |
 | `--fuse-min-conf`            | 0.4     | Min mean confidence to insert a fused gap    |
+| `--no-wagon-only`            | off     | Count every segment, including engines/brake vans |
+| `--no-gap-validation`        | off     | Treat every tracked candidate as a boundary  |
+| `--gap-min-motion-px`        | 12.0    | Min centre displacement over a track (real gaps measured 110–615 px) |
+| `--gap-static-max-px`        | 4.0     | At/below this ⇒ `REJECTED_STATIC` (measured FPs moved ≤0.2 px) |
+| `--gap-min-motion-px-sec`    | 8.0     | Min apparent speed                           |
+| `--gap-max-motion-px-sec`    | 2000.0  | Max apparent speed                           |
+| `--gap-motion-tolerance`     | 4.0     | Max factor from the camera's median gap speed |
+| `--gap-min-confidence`       | 0.45    | Min mean track confidence (per-frame detector threshold unchanged) |
+| `--gap-min-track-frames`     | 4       | Min track extent in frames                   |
+| `--gap-max-track-gap`        | 20      | Longest blind run tolerated inside a track   |
+| `--gap-min-monotonic`        | 0.60    | Min fraction of steps sharing the direction  |
+| `--no-support-classification`| off     | Skip top/side classification of support cameras |
 | `--render-videos`            | off     | Also render the overlay MP4s (~100 MB/camera) |
 | `--no-report`                | off     | Skip evidence selection + `combined_report.pdf` |
 | `--report-dpi`               | 150     | PDF page raster resolution; raise for bigger evidence images |
@@ -340,12 +434,33 @@ wagon_count/
 
 Required exact filenames:
 
-| `inputs/`            | `models/`                  |
-|----------------------|----------------------------|
-| `right_up.mp4`       | `right_up_wagon_gap.pt`    |
-| `left_up.mp4`        | `left_up_wagon_gap.pt`     |
-| `right_up_top.mp4`   | `top_gap.pt`               |
-| `left_up_top.mp4`    | `side_classification.pt`   |
+| `inputs/`            | `models/`                  | Used by |
+|----------------------|----------------------------|---------|
+| `right_up.mp4`       | `right_up_wagon_gap.pt`    | RIGHT_UP gap detection |
+| `left_up.mp4`        | `left_up_wagon_gap.pt`     | LEFT_UP gap detection |
+| `right_up_top.mp4`   | `top_gap.pt`               | both TOP cameras, gap detection |
+| `left_up_top.mp4`    | `side_classification.pt`   | RIGHT_UP (master) + LEFT_UP classification |
+|                      | `top_classification.pt`    | RIGHT_UP_TOP + LEFT_UP_TOP classification — **optional** |
+
+### `top_classification.pt` (optional)
+
+Classifies the two overhead cameras into ENGINE / WAGON / BRAKE_VAN. It improves
+support-camera classification, synchronization and PDF/video labels. It is
+**never a counting authority** — RIGHT_UP alone determines the wagon count — so
+if the file is absent the run still completes, the top cameras are simply not
+classified, and `validate_ec2.py` reports the missing capability as a FAIL.
+
+If you keep it in S3, copy it in as a deployment step (the pipeline itself
+contains no S3 code, by design):
+
+```bash
+aws s3 cp s3://<your-bucket>/top_classification.pt models/top_classification.pt
+python validate_ec2.py          # confirms it loads and prints its real class names
+```
+
+The semantic mapping is derived from the model's **actual** `model.names` at
+runtime — class indices are never assumed, and an unrecognised class is mapped to
+`UNKNOWN` and reported, never silently treated as a WAGON.
 
 The model paths in the Python code are unchanged — the code still expects
 these names in `./models`. Excluding them from Git changes nothing at

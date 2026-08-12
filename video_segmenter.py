@@ -198,6 +198,7 @@ def render_processed_video(
     verbose: bool = True,
     time_offset: float = 0.0,
     drop_out_of_range: bool = False,
+    non_wagon_regions: Optional[List[Dict]] = None,
 ) -> str:
     """Render the overlay video for ONE camera.
 
@@ -217,6 +218,11 @@ def render_processed_video(
     drop_out_of_range :
         When True, global wagons outside this camera's footage are not drawn at
         all rather than being clamped onto the final frame.
+    non_wagon_regions :
+        Leading / trailing / interior ENGINE and BRAKE_VAN regions in MASTER
+        time, as produced by ``train_structure.WagonWindow.summary()``. The full
+        train is still shown, but these regions are labelled with their
+        classification and explicitly carry NO GW id -- they are not wagons.
     """
     if local_tracks.fps <= 0:
         raise ValueError(f"Cannot render: invalid fps for {local_tracks.camera_id}")
@@ -339,6 +345,16 @@ def render_processed_video(
         # Current global wagon
         current_wagon = frame_to_wagon.get(frame_idx)
 
+        # Non-wagon region (engine / brake van): shown, but WITHOUT a GW id.
+        current_non_wagon = None
+        if current_wagon is None and non_wagon_regions:
+            t_local = (frame_idx / fps) if fps > 0 else 0.0
+            t_global = t_local + time_offset
+            for nw in non_wagon_regions:
+                if nw.get("start_time", 0.0) <= t_global <= nw.get("end_time", 0.0):
+                    current_non_wagon = nw
+                    break
+
         # Info panel -- explicit "label: value" layout for debugging.
         info_lines: List[Tuple[str, Tuple[int, int, int]]] = []
         info_lines.append((f"Camera:               {local_tracks.camera_id}",
@@ -351,6 +367,15 @@ def render_processed_video(
             info_lines.append((f"Current Wagon:        {current_wagon.global_id}",
                                _WAGON_TEXT_COLOR))
             info_lines.append((f"Classification:       {cls}",
+                               color))
+        elif current_non_wagon is not None:
+            # Engine / brake van: labelled, explicitly NOT given a wagon id.
+            cls = current_non_wagon.get("classification", SegmentClass.UNKNOWN)
+            color = _CLASS_COLORS.get(cls, _INFO_TEXT_COLOR)
+            info_lines.append((f"Current Wagon:        n/a  ({cls} is not a wagon)",
+                               color))
+            info_lines.append((f"Classification:       {cls}  "
+                               f"[{current_non_wagon.get('position', '')}, not counted]",
                                color))
         else:
             info_lines.append(("Current Wagon:        —", _INFO_TEXT_COLOR))

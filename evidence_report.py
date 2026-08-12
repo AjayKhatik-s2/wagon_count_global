@@ -693,6 +693,38 @@ class _ReportBuilder:
 
         y = max(y_left, y_right) + int(self.s_body * 1.0)
 
+        # ---- Train structure: engines and brake vans are NOT wagons ----
+        ww = getattr(state, "wagon_window", None) or {}
+        if ww:
+            def _fmt(classes: Dict[str, int]) -> str:
+                if not classes:
+                    return "none"
+                return ", ".join(f"{n} x {c}" for c, n in sorted(classes.items()))
+
+            y = self._kv_block(
+                p, self.margin, y, self.w - 2 * self.margin,
+                "TRAIN STRUCTURE  (only WAGONs are counted)",
+                [
+                    ("leading non-wagon",
+                     _fmt(ww.get("leading_non_wagon_classes", {}))),
+                    ("WAGON region",
+                     f"{ww.get('first_wagon') or '-'} .. {ww.get('last_wagon') or '-'}"
+                     f"   frames {ww.get('wagon_start_frame')}-"
+                     f"{ww.get('wagon_end_frame')}"),
+                    ("trailing non-wagon",
+                     _fmt(ww.get("trailing_non_wagon_classes", {}))),
+                ] + ([("excluded inside region",
+                       _fmt(ww.get("interior_non_wagon_classes", {})))]
+                     if ww.get("interior_non_wagon_count") else []) + [
+                    ("TOTAL WAGONS", str(ww.get("master_wagon_count",
+                                                d.get("total_wagons", 0)))),
+                    ("not counted",
+                     "ENGINE and BRAKE_VAN are real train objects but never "
+                     "receive a GW id"),
+                ],
+                emphasise={"TOTAL WAGONS"},
+            )
+
         # ---- Evidence policy ----
         avail = sum(e.available_count for e in events)
         total = sum(e.total_slots for e in events)

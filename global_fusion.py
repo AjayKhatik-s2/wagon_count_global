@@ -73,6 +73,7 @@ from global_train_state import (
     GlobalTrainState,
     GlobalWagon,
     LocalCameraTracks,
+    SegmentClass,
     _MasterClassification,
 )
 # build_global_wagons is REUSED UNCHANGED: its `b <= prev` collapse rule,
@@ -305,6 +306,9 @@ class SupportAlignment:
     matches: Dict[int, GapObservation] = field(default_factory=dict)
     missing_global_gap_ids: List[int] = field(default_factory=list)
     extra_observations: List[GapObservation] = field(default_factory=list)
+    non_wagon_observations: List[GapObservation] = field(default_factory=list)
+    """Observations in this camera's engine / brake-van region: excluded from
+    wagon alignment, kept for diagnostics. They can never create a global gap."""
     total_cost: float = 0.0
     status: str = "ok"
 
@@ -316,6 +320,7 @@ class SupportAlignment:
             "n_match": len(self.matches),
             "n_missing": len(self.missing_global_gap_ids),
             "n_extra": len(self.extra_observations),
+            "n_non_wagon_excluded": len(self.non_wagon_observations),
             "total_cost": (round(self.total_cost, 4)
                            if math.isfinite(self.total_cost) else None),
             "matched_global_gap_ids": sorted(self.matches.keys()),
@@ -733,11 +738,35 @@ def camera_covers(t_global: float, delta: float, fps: float,
     return project_global_time_to_local(t_global, delta, fps, total_frames) is not None
 
 
+def filter_observations_to_wagon_region(
+    obs: Sequence[GapObservation],
+    region: Any = None,
+) -> Tuple[List[GapObservation], List[GapObservation]]:
+    """Split a support camera's observations into (in-wagon-region, outside).
+
+    Observations in the camera's engine or brake-van region are excluded from
+    wagon synchronization: an engine-to-wagon transition is not a wagon
+    boundary, so letting it anchor the alignment would corrupt the offset.
+    Excluded observations are returned separately and reported, never deleted.
+
+    `region` is a ``train_structure.LocalWagonRegion`` or None. When the region
+    is unknown, nothing is excluded -- a missing classification must not silently
+    drop evidence.
+    """
+    if region is None:
+        return list(obs), []
+    inside, outside = [], []
+    for o in obs:
+        (inside if region.contains_time(o.local_time) else outside).append(o)
+    return inside, outside
+
+
 def attach_support_evidence(
     global_gaps: List[GlobalGap],
     support_tracks: Sequence[LocalCameraTracks],
     cfg: FusionConfig = DEFAULT_CONFIG,
     verbose: bool = True,
+    wagon_regions: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, SupportAlignment]:
     """Align each support camera to the frozen sequence and hang evidence off it.
 
@@ -753,17 +782,27 @@ def attach_support_evidence(
 
     master_obs = [g.master_observation for g in global_gaps]
     alignments: Dict[str, SupportAlignment] = {}
+    wagon_regions = wagon_regions or {}
 
     for st in support_tracks:
         cam = st.camera_id
         try:
             sup_obs = to_gap_observations(st)
 
+            # Keep engine / brake-van observations out of wagon synchronization.
+            sup_obs, non_wagon_obs = filter_observations_to_wagon_region(
+                sup_obs, wagon_regions.get(cam))
+            if non_wagon_obs and verbose:
+                print(f"  [FUSE/{cam}] {len(non_wagon_obs)} observation(s) lie "
+                      f"outside this camera's wagon region -> excluded from wagon "
+                      f"alignment (kept as diagnostics)")
+
             if st.fps <= 0 or st.total_frames <= 0:
                 off = CameraOffset(camera_id=cam, status=OFFSET_UNRESOLVED,
                                    reason=REASON_NO_METADATA)
-                alignments[cam] = SupportAlignment(camera_id=cam, offset=off,
-                                                   status="no-metadata")
+                alignments[cam] = SupportAlignment(
+                    camera_id=cam, offset=off, status="no-metadata",
+                    non_wagon_observations=list(non_wagon_obs))
                 for g in global_gaps:
                     g.unavailable_cameras[cam] = REASON_NO_METADATA
                 continue
@@ -775,6 +814,7 @@ def attach_support_evidence(
                 alignments[cam] = SupportAlignment(
                     camera_id=cam, offset=off, status="offset-unresolved",
                     extra_observations=_with_offset(sup_obs, 0.0),
+                    non_wagon_observations=list(non_wagon_obs),
                 )
                 for g in global_gaps:
                     g.unavailable_cameras[cam] = REASON_OFFSET_UNRESOLVED
@@ -802,6 +842,7 @@ def attach_support_evidence(
                 else:
                     gap.unavailable_cameras[cam] = REASON_OUT_OF_RANGE
             al.extra_observations = [shifted[j] for j in extra_idx]
+            al.non_wagon_observations = list(non_wagon_obs)
             alignments[cam] = al
 
             if verbose:
@@ -905,6 +946,7 @@ def assert_invariants(
     alignments: Dict[str, SupportAlignment],
     support_tracks: Sequence[LocalCameraTracks],
     strict: bool = True,
+    wagon_window: Any = None,
 ) -> Dict[str, Any]:
     """Verify the fixed-master invariant. Fails loudly by default.
 
@@ -942,11 +984,37 @@ def assert_invariants(
     if any(b < a for a, b in zip(frames, frames[1:])):
         problems.append("global gaps are not ordered by master frame")
 
-    # 7/8. wagon count follows from the gap count
+    # 7/8. wagon count follows from the gap count, then the wagon window
     expected = len(global_gaps) + 1
     collapsed = expected - len(wagons)
     if len(wagons) > expected:
         problems.append(f"total_wagons={len(wagons)} exceeds global_gaps+1={expected}")
+
+    # 13/14. ONLY WAGONS ARE COUNTED -- no engine or brake van may hold a GW id.
+    # Checked only under wagon-only counting; `--no-wagon-only` deliberately
+    # reproduces the older "every segment is a wagon" behaviour for A/B runs.
+    n_bad_class = 0
+    if wagon_window is not None:
+        for w in wagons:
+            if w.classification in (SegmentClass.ENGINE, SegmentClass.BRAKE_VAN):
+                n_bad_class += 1
+                problems.append(f"{w.global_id} is classified {w.classification} "
+                                f"but holds a wagon id; engines and brake vans "
+                                f"must never receive one")
+
+    if wagon_window is not None:
+        if len(wagons) != wagon_window.master_wagon_count:
+            problems.append(f"total_wagons={len(wagons)} != wagon window count "
+                            f"{wagon_window.master_wagon_count}")
+        # Non-wagon objects are preserved, and are outside the counted set.
+        excluded = (len(wagon_window.leading_non_wagon_objects)
+                    + len(wagon_window.trailing_non_wagon_objects)
+                    + len(wagon_window.interior_non_wagon_objects))
+        if len(wagons) + excluded != wagon_window.total_segments:
+            problems.append(f"wagons({len(wagons)}) + non-wagon({excluded}) != "
+                            f"segments({wagon_window.total_segments}): a segment "
+                            f"was lost or double-counted")
+        collapsed = expected - wagon_window.total_segments
     if collapsed < 0:
         problems.append(f"negative collapsed-boundary count ({collapsed})")
 
@@ -978,11 +1046,19 @@ def assert_invariants(
         "right_up_final_gap_count": n_master,
         "global_gap_count": len(global_gaps),
         "total_wagons": len(wagons),
-        "expected_wagons_gaps_plus_one": expected,
+        "master_wagon_count": (wagon_window.master_wagon_count
+                               if wagon_window is not None else len(wagons)),
+        "segments_before_wagon_window": expected,
         "collapsed_boundaries": collapsed,
+        "non_wagon_excluded": (
+            len(wagon_window.leading_non_wagon_objects)
+            + len(wagon_window.trailing_non_wagon_objects)
+            + len(wagon_window.interior_non_wagon_objects)
+            if wagon_window is not None else 0),
+        "engine_or_brakevan_with_wagon_id": n_bad_class,
         "invariant_holds": not problems,
         "violations": problems,
-        "checks_run": 12,
+        "checks_run": 14,
     }
 
     if problems:
@@ -1004,13 +1080,27 @@ def assemble_global_train_state_master_fixed(
     initial_classifications: Sequence[_MasterClassification],
     config: Optional[FusionConfig] = None,
     verbose: bool = True,
+    wagon_regions: Optional[Dict[str, Any]] = None,
+    wagon_only: bool = True,
 ) -> GlobalTrainState:
     """Build the GlobalTrainState under the fixed-master invariant.
 
-        global gaps  == RIGHT_UP final gaps        (always)
-        total_wagons == global gaps + 1            (existing convention)
+        global gaps  == RIGHT_UP validated gaps    (always)
+        total_wagons == the WAGON units of the master's wagon window
 
-    Support cameras contribute association + evidence + diagnostics only.
+    ENGINE and BRAKE_VAN are preserved as metadata but never receive a GW id and
+    never extend the wagon timeline. Support cameras contribute association +
+    evidence + diagnostics only.
+
+    Parameters
+    ----------
+    wagon_only :
+        True (default) restricts the count to the master's wagon window, so
+        engines and brake vans are excluded. False keeps the previous
+        "every segment is a wagon" behaviour for A/B comparison.
+    wagon_regions :
+        Optional ``{camera_id: LocalWagonRegion}``, used to keep support
+        observations from engine / brake-van regions out of wagon alignment.
     """
     cfg = config or DEFAULT_CONFIG
 
@@ -1018,21 +1108,31 @@ def assemble_global_train_state_master_fixed(
     global_gaps = build_global_gap_sequence(master_tracks)
     if verbose:
         print(f"[FUSE] master({master_tracks.camera_id}) is authoritative: "
-              f"{len(global_gaps)} final gap(s) -> {len(global_gaps)} global gap(s)")
+              f"{len(global_gaps)} validated gap(s) -> {len(global_gaps)} global gap(s)")
 
     # ---- 2. support alignment (evidence only; cannot touch the sequence) ----
-    alignments = attach_support_evidence(global_gaps, support_tracks, cfg, verbose)
+    alignments = attach_support_evidence(global_gaps, support_tracks, cfg, verbose,
+                                         wagon_regions=wagon_regions)
 
-    # ---- 3. wagons: build_global_wagons REUSED UNCHANGED, fed master.gaps ----
-    # This is the whole counting path. No synthetic gap can reach it: the input
-    # is literally the master's own GapEvent list.
-    wagons = build_global_wagons(
+    # ---- 3. segments: build_global_wagons REUSED UNCHANGED, fed master.gaps ----
+    # No synthetic gap can reach it: the input is literally the master's own
+    # validated GapEvent list.
+    all_segments = build_global_wagons(
         list(master_tracks.gaps),
         master_total_frames=master_tracks.total_frames,
         master_fps=master_tracks.fps,
         initial_classifications=list(initial_classifications),
         support_camera_ids=[st.camera_id for st in support_tracks],
     )
+
+    # ---- 3b. WAGON-ONLY selection: engines and brake vans get no GW id ----
+    wagon_window = None
+    if wagon_only:
+        from train_structure import get_master_wagon_window
+        wagon_window = get_master_wagon_window(all_segments, verbose=verbose)
+        wagons = wagon_window.wagon_units
+    else:
+        wagons = all_segments
 
     # ---- 4. real supporting_cameras, replacing the old static all-four list ----
     _assign_real_supporting_cameras(wagons, global_gaps, master_tracks.camera_id)
@@ -1049,7 +1149,7 @@ def assemble_global_train_state_master_fixed(
     checks = assert_invariants(
         global_gaps=global_gaps, master_tracks=master_tracks, wagons=wagons,
         alignments=alignments, support_tracks=support_tracks,
-        strict=cfg.strict_invariants,
+        strict=cfg.strict_invariants, wagon_window=wagon_window,
     )
 
     # ---- 7. assemble state ----
@@ -1101,13 +1201,27 @@ def assemble_global_train_state_master_fixed(
     state.interval_diagnostics = interval_diags
     state.invariant_checks = checks
 
+    if wagon_window is not None:
+        state.wagon_window = wagon_window.summary()
+        state.master_wagon_count = wagon_window.master_wagon_count
+    else:
+        state.master_wagon_count = len(wagons)
+    if wagon_regions:
+        state.support_wagon_regions = {
+            cam: (reg.to_dict() if hasattr(reg, "to_dict") else {})
+            for cam, reg in wagon_regions.items()}
+
     if verbose:
         n_extra = sum(len(v) for v in state.extra_support_observations.values())
         print(f"[FUSE] {n_extra} EXTRA support observation(s) recorded as "
               f"diagnostics; none became a global gap")
-        print(f"[FUSE] INVARIANT: right_up_final_gaps={checks['right_up_final_gap_count']} "
-              f"== global_gaps={checks['global_gap_count']}  ->  "
-              f"total_wagons={checks['total_wagons']}")
+        print(f"[FUSE] INVARIANT: right_up_validated_gaps="
+              f"{checks['right_up_final_gap_count']} "
+              f"== global_gaps={checks['global_gap_count']}")
+        if wagon_window is not None:
+            print(f"[FUSE] WAGON-ONLY: {checks['non_wagon_excluded']} non-wagon "
+                  f"object(s) excluded (no GW id)  ->  "
+                  f"total_wagons={checks['total_wagons']}")
 
     return state
 

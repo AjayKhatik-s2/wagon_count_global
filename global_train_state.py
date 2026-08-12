@@ -340,6 +340,42 @@ class GlobalTrainState:
     invariant_checks: Dict[str, Any] = field(default_factory=dict)
     """Machine-readable result of the fixed-master invariant assertions."""
 
+    # -------------------------------------------------------------------------
+    # Train structure + gap validation (wagon-only counting).
+    #
+    #   ENGINE and BRAKE_VAN are real train objects and are preserved here, but
+    #   they never receive a GW id and never extend the wagon timeline.
+    #   `wagons` therefore contains WAGON units only.
+    # -------------------------------------------------------------------------
+    master_wagon_count: int = 0
+    """Number of WAGON units in the master's wagon window == total_wagons."""
+
+    wagon_window: Dict[str, Any] = field(default_factory=dict)
+    """first/last wagon, wagon_start/end frame+time, and the leading / trailing /
+    interior non-wagon objects (engines, brake vans) that were excluded."""
+
+    support_wagon_regions: Dict[str, Any] = field(default_factory=dict)
+    """Each support camera's own local wagon region, used to keep engine and
+    brake-van observations out of wagon synchronization."""
+
+    gap_validation_statistics: Dict[str, Any] = field(default_factory=dict)
+    """Per camera: raw detections -> tracked candidates -> valid gap events,
+    with counts per rejection reason."""
+
+    gap_rejection_details: Dict[str, Any] = field(default_factory=dict)
+    """Per camera: every rejected candidate with its reason and measured motion
+    features. Nothing is discarded silently."""
+
+    gap_validation_config: Dict[str, Any] = field(default_factory=dict)
+    """The exact thresholds used, so a run is reproducible and auditable."""
+
+    classification_model_by_camera: Dict[str, str] = field(default_factory=dict)
+    """Which classification model each camera used."""
+
+    top_classification_model_info: Dict[str, Any] = field(default_factory=dict)
+    """The top model's REAL class names and the semantic mapping derived from
+    them, including any unexpected classes (mapped to UNKNOWN, never WAGON)."""
+
     def add_note(self, text: str) -> None:
         self.notes.append(text)
 
@@ -386,6 +422,15 @@ class GlobalTrainState:
             "interval_diagnostics": list(self.interval_diagnostics),
             "extra_support_observations": dict(self.extra_support_observations),
             "global_gaps": list(self.global_gaps),
+            # ---- train structure + gap validation ----
+            "master_wagon_count": self.master_wagon_count,
+            "wagon_window": dict(self.wagon_window),
+            "support_wagon_regions": dict(self.support_wagon_regions),
+            "classification_model_by_camera": dict(self.classification_model_by_camera),
+            "top_classification_model_info": dict(self.top_classification_model_info),
+            "gap_validation_statistics": dict(self.gap_validation_statistics),
+            "gap_validation_config": dict(self.gap_validation_config),
+            "gap_rejection_details": dict(self.gap_rejection_details),
         }
 
     def to_json(self, indent: int = 2) -> str:

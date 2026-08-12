@@ -82,6 +82,8 @@ from global_train_state import (
 from tracker_engine import GapTracker, MasterClassifier, segments_from_gaps
 import global_alignment as ga
 import global_fusion as gf
+import gap_validation as gval
+import train_structure as ts
 import video_segmenter as vs
 import evidence_report as er
 
@@ -246,6 +248,56 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--classification-samples", type=int, default=5,
                    help="Frames per segment for side_classification.pt vote (default: 5)")
 
+    # ---- gap validation: raw YOLO gaps are CANDIDATES, not boundaries --------
+    _gv = gval.DEFAULT_GAP_VALIDATION
+    p.add_argument("--no-gap-validation", action="store_true",
+                   help="Disable motion/temporal gap validation and treat every "
+                        "tracked candidate as a wagon boundary (previous behaviour)")
+    p.add_argument("--gap-min-track-frames", type=int, default=_gv.min_track_frames,
+                   help=f"Min track extent in frames (default: {_gv.min_track_frames})")
+    p.add_argument("--gap-min-motion-px", type=float, default=_gv.min_motion_px,
+                   help=f"Min centre displacement over the track, px "
+                        f"(default: {_gv.min_motion_px}; smallest real gap measured "
+                        f"110.7 px)")
+    p.add_argument("--gap-static-max-px", type=float, default=_gv.static_max_motion_px,
+                   help=f"At or below this displacement a track is REJECTED_STATIC "
+                        f"(default: {_gv.static_max_motion_px}; measured false "
+                        f"positives moved <= 0.2 px)")
+    p.add_argument("--gap-min-motion-px-sec", type=float,
+                   default=_gv.min_motion_px_per_sec,
+                   help=f"Min apparent speed, px/s (default: {_gv.min_motion_px_per_sec})")
+    p.add_argument("--gap-max-motion-px-sec", type=float,
+                   default=_gv.max_motion_px_per_sec,
+                   help=f"Max apparent speed, px/s (default: {_gv.max_motion_px_per_sec})")
+    p.add_argument("--gap-motion-tolerance", type=float,
+                   default=_gv.train_motion_tolerance,
+                   help=f"Max factor by which a gap's speed may differ from its "
+                        f"camera's median gap speed (default: "
+                        f"{_gv.train_motion_tolerance})")
+    p.add_argument("--gap-min-confidence", type=float, default=_gv.min_mean_confidence,
+                   help=f"Min mean track confidence (default: "
+                        f"{_gv.min_mean_confidence}; the per-frame detector "
+                        f"threshold is unchanged)")
+    p.add_argument("--gap-max-track-gap", type=int,
+                   default=_gv.max_detection_gap_frames,
+                   help=f"Longest blind run tolerated inside one track, frames "
+                        f"(default: {_gv.max_detection_gap_frames})")
+    p.add_argument("--gap-min-monotonic", type=float,
+                   default=_gv.min_monotonic_fraction,
+                   help=f"Min fraction of steps sharing the dominant direction "
+                        f"(default: {_gv.min_monotonic_fraction})")
+
+    # ---- train structure ----------------------------------------------------
+    p.add_argument("--no-wagon-only", action="store_true",
+                   help="Count every segment instead of only the WAGON region "
+                        "between the first and last WAGON. Off by default: "
+                        "ENGINE and BRAKE_VAN are not wagons and never receive a "
+                        "GW id.")
+    p.add_argument("--no-support-classification", action="store_true",
+                   help="Skip classifying support cameras (top/side models). "
+                        "Support classification only refines evidence and "
+                        "synchronization; it never changes the wagon count.")
+
     # ---- fusion ------------------------------------------------------------
     p.add_argument("--fusion", choices=("master-fixed", "legacy"),
                    default="master-fixed",
@@ -370,6 +422,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    # top_classification.pt is OPTIONAL: it refines top-camera classification,
+    # evidence and synchronization, but it is never a counting authority, so a
+    # missing file degrades capability instead of failing the run.
+    top_cls_path: Optional[str] = None
+    _top_candidate = os.path.join(args.models_dir, ts.TOP_CLASSIFICATION_MODEL)
+    if os.path.exists(_top_candidate):
+        top_cls_path = os.path.abspath(_top_candidate)
+    else:
+        print(f"NOTE: {ts.TOP_CLASSIFICATION_MODEL} not found in {args.models_dir} -- "
+              f"RIGHT_UP_TOP / LEFT_UP_TOP will not be classified. The wagon count "
+              f"is unaffected (RIGHT_UP is the only counting authority). Place the "
+              f"file there to enable top classification, e.g.\n"
+              f"      aws s3 cp s3://<bucket>/{ts.TOP_CLASSIFICATION_MODEL} "
+              f"{args.models_dir}/", file=sys.stderr)
+
     print(f"  RIGHT_UP video           : {right_up_video}")
     print(f"  LEFT_UP video            : {left_up_video}")
     print(f"  RIGHT_UP_TOP video       : {right_up_top_video}")
@@ -389,6 +456,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         os.makedirs(processed_videos_dir, exist_ok=True)
 
     keep_raw = not args.no_raw_detections
+    _pending_notes: List[str] = []
 
     # ------------------------------------------------------------------
     # STEP 1 -- per-camera gap tracking
@@ -428,11 +496,60 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
 
     print()
-    print("  Local counts after Step 1:")
+    print("  Local counts after Step 1 (raw tracked candidates):")
     for cam in ALL_CAMERAS:
         t = tracks[cam]
-        print(f"    {cam:<14}  wagons={t.local_wagon_count:>3}   gaps={len(t.gaps):>3}   "
+        print(f"    {cam:<14}  candidates={len(t.gaps):>3}   "
               f"fps={t.fps:.2f}   frames={t.total_frames}")
+    print()
+
+    # ------------------------------------------------------------------
+    # STEP 1b -- GAP VALIDATION
+    #
+    # A raw YOLO gap detection is a CANDIDATE, not a wagon boundary. Each
+    # tracked candidate is checked for temporal persistence, detection
+    # continuity, real motion, plausible speed, trajectory consistency,
+    # direction and confidence, and duplicates are collapsed. The train is
+    # moving, so a detection pinned to one pixel column is background, not a
+    # gap between wagons.
+    #
+    # Detection and tracking themselves are UNCHANGED: this filters the
+    # GapEvents the existing tracker already emitted.
+    # ------------------------------------------------------------------
+    print("-" * 70)
+    print("  STEP 1b  Gap validation (candidates -> valid wagon boundaries)")
+    print("-" * 70)
+    gv_cfg = gval.GapValidationConfig(
+        enabled=not args.no_gap_validation,
+        min_track_frames=int(args.gap_min_track_frames),
+        max_detection_gap_frames=int(args.gap_max_track_gap),
+        min_motion_px=float(args.gap_min_motion_px),
+        static_max_motion_px=float(args.gap_static_max_px),
+        min_motion_px_per_sec=float(args.gap_min_motion_px_sec),
+        max_motion_px_per_sec=float(args.gap_max_motion_px_sec),
+        min_monotonic_fraction=float(args.gap_min_monotonic),
+        min_mean_confidence=float(args.gap_min_confidence),
+        train_motion_tolerance=float(args.gap_motion_tolerance),
+    )
+    gap_validation: Dict[str, gval.GapValidationResult] = {}
+    for cam in ALL_CAMERAS:
+        t = tracks[cam]
+        raw_n = sum(len(v) for v in (t.raw_frame_detections or {}).values())
+        res = gval.validate_gap_events(t.gaps, cam, gv_cfg,
+                                       raw_detection_count=raw_n, verbose=verbose)
+        gap_validation[cam] = res
+        # Replace the camera's gap list with the validated subset and restore
+        # track_id as a contiguous temporal rank, as the tracker produces.
+        t.gaps = gval.renumber_gap_events(res.accepted)
+
+    print()
+    print("  Validated counts after Step 1b:")
+    for cam in ALL_CAMERAS:
+        t = tracks[cam]
+        r = gap_validation[cam]
+        print(f"    {cam:<14}  raw_det={r.raw_detection_count:>4}  "
+              f"candidates={r.tracked_candidate_count:>3}  "
+              f"valid_gaps={len(t.gaps):>3}  rejected={len(r.rejected):>3}")
     print()
 
     # ------------------------------------------------------------------
@@ -451,6 +568,70 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"WARNING: master classification failed: {e}", file=sys.stderr)
         traceback.print_exc()
         initial_classifications = []
+
+    # ------------------------------------------------------------------
+    # STEP 2b -- SUPPORT-CAMERA CLASSIFICATION
+    #
+    #   RIGHT_UP      -> side_classification.pt   (Step 2, master authority)
+    #   LEFT_UP       -> side_classification.pt   (same side geometry)
+    #   RIGHT_UP_TOP  -> top_classification.pt
+    #   LEFT_UP_TOP   -> top_classification.pt
+    #
+    # Purpose: identify each support camera's own engine / wagon / brake-van
+    # regions so that engine and brake-van observations are kept OUT of wagon
+    # synchronization, and so the PDF and overlay videos can label them.
+    # Support cameras are never counting authorities.
+    # ------------------------------------------------------------------
+    support_regions: Dict[str, ts.LocalWagonRegion] = {}
+    classification_models: Dict[str, str] = {CAMERA_RIGHT_UP: os.path.basename(side_cls_path)}
+    top_label_mapping = None
+    if not args.no_support_classification:
+        print()
+        print("-" * 70)
+        print("  STEP 2b  Support-camera classification (top / side models)")
+        print("-" * 70)
+        _cache: Dict[str, object] = {}
+        for cam in ALL_CAMERAS:
+            if cam == CAMERA_RIGHT_UP:
+                continue
+            want = ts.CAMERA_CLASSIFICATION_MODEL.get(cam)
+            path = (top_cls_path if want == ts.TOP_CLASSIFICATION_MODEL
+                    else side_cls_path)
+            if path is None:
+                classification_models[cam] = f"{want} (MISSING)"
+                support_regions[cam] = ts.LocalWagonRegion(
+                    camera_id=cam, classifier_model=f"{want} (missing)",
+                    reason=f"{want} not available; camera not classified")
+                print(f"  [CLASSIFY/{cam}] SKIPPED -- {want} is not available")
+                continue
+            try:
+                if path not in _cache:
+                    # Load each model ONCE and reuse it across cameras.
+                    _cache[path] = ts.load_segment_classifier(
+                        path, num_samples=args.classification_samples,
+                        verbose=verbose)
+                clf, mapping = _cache[path]           # type: ignore[misc]
+                if want == ts.TOP_CLASSIFICATION_MODEL:
+                    top_label_mapping = mapping
+                classification_models[cam] = os.path.basename(path)
+
+                t = tracks[cam]
+                segs = segments_from_gaps(t.gaps, t.total_frames)
+                labels: List[str] = []
+                if segs:
+                    cls = clf.classify_segments(t.video_path, segs)
+                    labels = [c.label for c in cls]
+                support_regions[cam] = ts.build_local_wagon_region(
+                    cam, segs, labels, t.fps,
+                    classifier_model=os.path.basename(path),
+                    unmapped_classes=mapping.unmapped, verbose=verbose)
+            except Exception as e:
+                print(f"WARNING: classification failed for {cam}: {e}", file=sys.stderr)
+                support_regions[cam] = ts.LocalWagonRegion(
+                    camera_id=cam, classifier_model=os.path.basename(str(path)),
+                    reason=f"classification error: {type(e).__name__}: {e}")
+                state_note = f"support_classification_failed:{cam}:{e}"
+                _pending_notes.append(state_note)
 
     # ------------------------------------------------------------------
     # STEP 3 -- cross-camera fusion
@@ -481,6 +662,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             initial_classifications=initial_classifications,
             config=fusion_cfg,
             verbose=verbose,
+            wagon_regions=support_regions,
+            wagon_only=not args.no_wagon_only,
         )
     else:
         print("WARNING: --fusion legacy allows support-camera observations to "
@@ -500,6 +683,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             verbose=verbose,
         )
         state.fusion_mode = "legacy"
+
+    # ---- attach validation / classification diagnostics to the state ----
+    state.gap_validation_statistics = {
+        cam: gap_validation[cam].to_dict(include_rejections=False)
+        for cam in ALL_CAMERAS if cam in gap_validation
+    }
+    state.gap_rejection_details = {
+        cam: gap_validation[cam].to_dict(include_rejections=True)["rejections"]
+        for cam in ALL_CAMERAS
+        if cam in gap_validation and gap_validation[cam].rejected
+    }
+    state.gap_validation_config = gv_cfg.describe()
+    state.classification_model_by_camera = classification_models
+    if top_label_mapping is not None:
+        state.top_classification_model_info = top_label_mapping.to_dict()
+    for note in _pending_notes:
+        state.add_note(note)
 
     # ------------------------------------------------------------------
     # STEP 4 -- write JSON
@@ -537,6 +737,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         # visualization only: they use the same GW ids as combined_report.pdf and
         # cannot change the count.
         offsets = _resolved_camera_offsets(state)
+        # The videos show the FULL train. Engine and brake-van regions are
+        # labelled with their classification but carry no GW id.
+        _ww = state.wagon_window or {}
+        non_wagon_regions = (list(_ww.get("leading_non_wagon_objects", []))
+                             + list(_ww.get("interior_non_wagon_objects", []))
+                             + list(_ww.get("trailing_non_wagon_objects", [])))
         for cam in ALL_CAMERAS:
             try:
                 out_mp4 = os.path.join(processed_videos_dir, f"{cam}_processed.mp4")
@@ -548,6 +754,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     verbose=verbose,
                     time_offset=offsets.get(cam, 0.0),
                     drop_out_of_range=(state.fusion_mode == "master-fixed"),
+                    non_wagon_regions=non_wagon_regions,
                 )
             except Exception as e:
                 print(f"WARNING: render failed for {cam}: {e}", file=sys.stderr)

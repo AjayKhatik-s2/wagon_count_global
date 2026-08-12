@@ -56,8 +56,17 @@ REQUIRED_MODELS = [
     ("right_up_wagon_gap.pt",  "gap detection on RIGHT_UP (master)", "detect"),
     ("left_up_wagon_gap.pt",   "gap detection on LEFT_UP",           "detect"),
     ("top_gap.pt",             "gap detection on both TOP cameras",  "detect"),
-    ("side_classification.pt", "ENGINE / WAGON / BRAKE_VAN on RIGHT_UP", None),
+    ("side_classification.pt", "ENGINE / WAGON / BRAKE_VAN on RIGHT_UP and LEFT_UP",
+     None),
+    ("top_classification.pt",  "ENGINE / WAGON / BRAKE_VAN on RIGHT_UP_TOP and "
+                               "LEFT_UP_TOP", None),
 ]
+
+#: Models whose absence disables a capability but does NOT stop a run. The wagon
+#: count comes from RIGHT_UP alone, so top classification is not count-critical.
+#: It is still reported as a FAIL of the *top classification capability* so a
+#: missing file can never pass unnoticed, and no other model is ever substituted.
+CAPABILITY_ONLY_MODELS = {"top_classification.pt"}
 
 MIN_PYTHON = (3, 10)
 
@@ -250,7 +259,11 @@ def check_models(models_dir: str) -> None:
         path = os.path.join(models_dir, filename)
         label = f"{filename}  ({role})"
         if not os.path.isfile(path):
-            _record("FAIL", f"{label} -- not found", path)
+            if filename in CAPABILITY_ONLY_MODELS:
+                # Reported once, as a capability FAIL, in section 6b.
+                _record("INFO", f"{label} -- not present (see 6b)", path)
+            else:
+                _record("FAIL", f"{label} -- not found", path)
         elif os.path.getsize(path) == 0:
             _record("FAIL", f"{label} -- file is empty (0 bytes)", path)
         else:
@@ -270,21 +283,49 @@ def check_model_loading(models_dir: str) -> None:
         path = os.path.join(models_dir, filename)
         label = f"{filename}"
         if not os.path.isfile(path):
-            _record("FAIL", f"{label} -- not found, cannot load", path)
+            if filename in CAPABILITY_ONLY_MODELS:
+                _record("FAIL",
+                        f"{label} -- NOT FOUND: top-camera classification "
+                        f"capability unavailable",
+                        f"{path}\n           Needed for RIGHT_UP_TOP and "
+                        f"LEFT_UP_TOP classification. No other model is "
+                        f"substituted.\n           The wagon count is unaffected "
+                        f"(RIGHT_UP is the only counting authority).\n"
+                        f"           Place it with e.g.:\n"
+                        f"             aws s3 cp s3://<bucket>/{filename} "
+                        f"{os.path.join(models_dir, filename)}")
+            else:
+                _record("FAIL", f"{label} -- not found, cannot load", path)
             continue
         try:
             model = YOLO(path)
             task = getattr(model, "task", None)
             names = getattr(model, "names", {}) or {}
             n = len(names)
-            shown = list(names.values())[:6]
-            detail = f"task={task}  classes={n}  names={shown}{' ...' if n > 6 else ''}"
+            detail = f"task={task}  classes={n}  names={dict(names)}"
 
             if expected_task is not None and task != expected_task:
                 _record("WARN", f"{label} loaded, but task is '{task}' "
                                 f"(expected '{expected_task}' for {role})", detail)
             else:
                 _record("PASS", f"{label} loaded  ({role})", detail)
+
+            # For classification models, report the semantic mapping derived from
+            # the model's REAL class names. Indices are never assumed, and an
+            # unrecognised class is never silently treated as a WAGON.
+            if "classification" in filename:
+                try:
+                    from train_structure import build_label_mapping
+                    lm = build_label_mapping(names, path)
+                    _record("INFO", f"{label} semantic mapping",
+                            "  ".join(f"{k!r}->{v}" for k, v in lm.mapping.items()))
+                    if lm.unmapped:
+                        _record("WARN",
+                                f"{label} has {len(lm.unmapped)} unexpected class "
+                                f"name(s); each maps to UNKNOWN, never to WAGON",
+                                f"unexpected: {lm.unmapped}")
+                except Exception as e:                  # pragma: no cover
+                    _record("WARN", f"{label} mapping could not be derived", str(e))
         except Exception as e:
             _record("FAIL", f"{label} -- failed to load",
                     f"{type(e).__name__}: {e}")

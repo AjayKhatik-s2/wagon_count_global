@@ -24,7 +24,10 @@ end for what was verified versus what could not be.
 > | Camera clock offsets | none — `t = frame/fps`, shared `t=0` assumed | estimated per camera, `RESOLVED`/`UNRESOLVED` |
 > | Support matching | independent nearest-neighbour, order can cross | order-preserving DP; crossing is unrepresentable |
 > | Unmatched support gap | promoted to a global gap | recorded as `EXTRA`, creates nothing |
-> | Count on the run in `results/` | 52 + 11 + 1 = **64** | 52 + 1 = **53** |
+> | Raw YOLO gap | is a wagon boundary | is a **candidate**; must pass motion/temporal validation |
+> | Engines / brake vans | receive `GW_n` ids and are counted | preserved as metadata, **never counted, never given an id** |
+> | Counted region | the whole video | the **wagon window**: first WAGON .. last WAGON |
+> | Count on the run in `results/` | 52 + 11 + 1 = **64** | validated master gaps → segments → wagon window only |
 > | `supporting_cameras` | static all-four list on every wagon | only cameras with a real matched observation |
 > | Out-of-range projection | clamped to the last frame | reported unavailable; never clamped |
 >
@@ -750,9 +753,17 @@ LEGACY  (--fusion legacy, described above):
 total_wagons = (number of RIGHT_UP gap tracks) + (number of inserted gaps) + 1
                ─ (boundaries collapsed by the `b <= prev` rule)
 
-CURRENT DEFAULT  (--fusion master-fixed, global_fusion.py):
-total_wagons = (number of RIGHT_UP gap tracks) + 1
-               ─ (boundaries collapsed by the `b <= prev` rule)
+CURRENT DEFAULT  (--fusion master-fixed + wagon-only):
+raw RIGHT_UP gap detections
+   -> tracked candidates                      (existing Kalman tracker)
+   -> VALIDATED gap events                    (gap_validation.py: motion,
+                                               persistence, trajectory,
+                                               direction, duplicates)
+   -> segments = validated gaps + 1           (build_global_wagons, unchanged)
+   -> classification per segment              (side_classification.pt)
+   -> WAGON WINDOW = first WAGON .. last WAGON
+total_wagons = WAGON units inside that window
+               (ENGINE and BRAKE_VAN excluded -- they never get a GW id)
 ```
 
 *Measured on the run in `results/`:* legacy gives `52 + 11 + 1 = 64`;
