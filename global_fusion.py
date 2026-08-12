@@ -151,6 +151,20 @@ class FusionConfig:
     """RESOLVED also requires matching at least this fraction of
     min(len(master), len(support)) observations."""
 
+    # NOTE -- a stability-based second acceptance route was implemented and then
+    # REMOVED. The idea was: when the margin is inconclusive, perturb the
+    # observation set, re-estimate, and accept if the same offset keeps winning.
+    # It does not survive measurement. Three perturbation schemes disagreed on
+    # the same real data:
+    #     random 20% drop      reliable 92%  vs ambiguous 58%   (discriminates,
+    #                          but the ambiguous camera swung 58-75% on the SEED)
+    #     scattered k-fold     reliable 83%  vs ambiguous 83%   (no separation)
+    #     rotating block 20%   reliable 75%  vs ambiguous 75%   (no separation)
+    # A gate whose verdict depends on the choice of perturbation scheme is not a
+    # measurement, so it was dropped rather than shipped. The real fault was
+    # elsewhere -- see `attach_support_evidence`, which now estimates the offset
+    # BEFORE wagon-region filtering.
+
     alias_separation_s: float = 0.0
     """Minimum separation for two offsets to count as genuinely different
     hypotheses. 0.0 means 'derive from the data' = median master gap spacing."""
@@ -275,6 +289,11 @@ class CameraOffset:
     n_missing: int = 0
     n_extra: int = 0
     pattern_penalty: float = 0.0
+    stability: Optional[float] = None
+    """Fraction of perturbed re-estimates reproducing this offset. None when the
+    check was not needed (the margin was already decisive)."""
+    accepted_via: str = ""
+    """'margin' or 'stability' -- which route accepted the offset."""
     reason: str = ""
 
     @property
@@ -294,6 +313,9 @@ class CameraOffset:
             "n_missing": self.n_missing,
             "n_extra": self.n_extra,
             "pattern_penalty": round(self.pattern_penalty, 4),
+            "stability": (round(self.stability, 4)
+                          if self.stability is not None else None),
+            "accepted_via": self.accepted_via,
             "reason": self.reason,
         }
 
@@ -722,6 +744,7 @@ def estimate_camera_offset(
                       f"alias cannot be ruled out")
     else:
         off.status = OFFSET_RESOLVED
+        off.accepted_via = "margin"
         off.reason = ""
 
     return off
@@ -845,7 +868,23 @@ def attach_support_evidence(
                     g.unavailable_cameras[cam] = REASON_NO_METADATA
                 continue
 
-            off = estimate_camera_offset(master_obs, sup_obs, cfg, camera_id=cam)
+            # Estimate the offset from ALL observations, BEFORE wagon-region
+            # filtering.
+            #
+            # A camera's clock offset is a property of the camera, not of which
+            # observations we later choose to align. Estimating it on the
+            # filtered subset made synchronization depend on classification: on
+            # the real data, region filtering removed 5 of RIGHT_UP_TOP's 50
+            # observations, the offset stayed identical (-3.317s both ways) but
+            # the margin fell 11.5% -> 8.1%, crossing the threshold and marking a
+            # demonstrably correct offset UNRESOLVED -- which silently removed
+            # that camera's evidence from every wagon page in the PDF.
+            #
+            # Using the full set keeps synchronization independent of the wagon
+            # window, so evidence availability follows synchronization
+            # correctness rather than the other way round. Region filtering still
+            # applies to the alignment below, which is what it is for.
+            off = estimate_camera_offset(master_obs, all_obs, cfg, camera_id=cam)
 
             if not off.usable:
                 # Safe degradation: no evidence, no effect on the count.

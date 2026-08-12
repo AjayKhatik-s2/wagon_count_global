@@ -277,6 +277,67 @@ class TestSupportCannotInflate(unittest.TestCase):
         self.assertEqual(st.invariant_checks["master_wagon_count"], 6)
         self.assertTrue(st.invariant_checks["invariant_holds"])
 
+    def test_region_filtering_cannot_unresolve_a_good_offset(self):
+        """Regression: wagon-region filtering used to remove a camera's evidence.
+
+        The offset was estimated from the FILTERED observations, so dropping a
+        few observations shrank the score margin below threshold and marked a
+        demonstrably correct offset UNRESOLVED -- which silently blanked that
+        camera on every PDF wagon page. A camera's clock offset is a property of
+        the camera, not of which observations we chose to align, so it is now
+        estimated BEFORE filtering.
+        """
+        master, cls = segments_and_labels([E] + [W] * 23)
+        mtimes = [g.center_time for g in master.gaps]
+        delta = 5.0
+        sup = make_tracks(CAMERA_RIGHT_UP_TOP, [t - delta for t in mtimes])
+
+        gaps = gf.build_global_gap_sequence(master)
+        # Region excludes the first few observations, as classification does.
+        region = ts.LocalWagonRegion(
+            camera_id=CAMERA_RIGHT_UP_TOP, found=True,
+            start_time=mtimes[3] - delta - 0.05, end_time=mtimes[-1] - delta + 5.0)
+
+        al = gf.attach_support_evidence(
+            gaps, [sup], gf.FusionConfig(), verbose=False,
+            wagon_regions={CAMERA_RIGHT_UP_TOP: region})[CAMERA_RIGHT_UP_TOP]
+
+        self.assertEqual(al.offset.status, gf.OFFSET_RESOLVED,
+                         f"filtering must not unresolve a good offset: "
+                         f"{al.offset.reason}")
+        self.assertAlmostEqual(al.offset.delta, delta, delta=0.35)
+        self.assertGreater(len(al.matches), 0, "evidence must be attached")
+        n_with = sum(1 for g in gaps
+                     if CAMERA_RIGHT_UP_TOP in g.support_observations)
+        self.assertGreater(n_with, 0, "wagon pages must carry this camera")
+        # and the count is untouched by any of it
+        self.assertEqual(len(gaps), len(master.gaps))
+
+    def test_offset_is_estimated_on_the_unfiltered_observation_set(self):
+        """The offset must be identical with and without region filtering."""
+        master, cls = segments_and_labels([E] + [W] * 19)
+        mtimes = [g.center_time for g in master.gaps]
+        sup = make_tracks(CAMERA_LEFT_UP, [t - 4.0 for t in mtimes])
+        gaps_a = gf.build_global_gap_sequence(master)
+        gaps_b = gf.build_global_gap_sequence(master)
+
+        no_filter = gf.attach_support_evidence(
+            gaps_a, [sup], gf.FusionConfig(), verbose=False)[CAMERA_LEFT_UP]
+        region = ts.LocalWagonRegion(
+            camera_id=CAMERA_LEFT_UP, found=True,
+            start_time=mtimes[2] - 4.0 - 0.05, end_time=mtimes[-1] - 4.0 + 5.0)
+        with_filter = gf.attach_support_evidence(
+            gaps_b, [sup], gf.FusionConfig(), verbose=False,
+            wagon_regions={CAMERA_LEFT_UP: region})[CAMERA_LEFT_UP]
+
+        self.assertAlmostEqual(no_filter.offset.delta, with_filter.offset.delta,
+                               places=6, msg="offset must not depend on filtering")
+        self.assertEqual(no_filter.offset.margin_ratio,
+                         with_filter.offset.margin_ratio,
+                         "margin must not depend on filtering either")
+        self.assertGreater(with_filter.excluded_observation_count, 0,
+                           "the filter must actually have excluded something")
+
     def test_observation_bookkeeping_balances_after_region_filtering(self):
         """Regression: the EC2 run reported a false invariant violation because
         MATCH+EXTRA was compared against the RAW observation count instead of the
