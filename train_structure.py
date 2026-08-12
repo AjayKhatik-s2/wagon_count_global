@@ -365,6 +365,56 @@ def get_master_wagon_window(
 # Support-camera local wagon region
 # =============================================================================
 
+def _attach_sample_recorder(clf, mapping: "LabelMapping") -> None:
+    """Make a classifier record the per-frame samples behind each segment.
+
+    Needed so the temporal layer can re-vote within a segment with confidence
+    weighting. Implemented by wrapping two methods on the instance -- the
+    existing sampling logic in ``tracker_engine.MasterClassifier`` is reused
+    verbatim, not duplicated, so the two cannot drift apart.
+
+    After ``classify_segments`` the classifier carries
+    ``sample_history: {segment_index: [ClassSample, ...]}``.
+    """
+    from temporal_classification import ClassSample
+
+    clf.sample_history = {}
+    clf._frame_buffer = []
+    clf._segment_counter = 0
+    _orig_frame = clf.classify_frame
+    _orig_one = clf._classify_one
+    _orig_segments = clf.classify_segments
+
+    def classify_frame(frame):
+        raw, conf = _orig_frame(frame)
+        clf._frame_buffer.append((raw, float(conf)))
+        return raw, conf
+
+    def _classify_one(cap, start_frame, end_frame):
+        # _classify_one is invoked exactly once per segment, in segment order,
+        # so the samples buffered during this call belong to this segment.
+        mark = len(clf._frame_buffer)
+        label, conf = _orig_one(cap, start_frame, end_frame)
+        idx = clf._segment_counter
+        clf._segment_counter += 1
+        clf.sample_history[idx] = [
+            ClassSample(frame=-1, time=0.0, raw_label=raw,
+                        semantic=mapping.semantic_for(raw), confidence=conf)
+            for raw, conf in clf._frame_buffer[mark:]
+        ]
+        return label, conf
+
+    def classify_segments(video_path, segments):
+        clf.sample_history = {}
+        clf._frame_buffer = []
+        clf._segment_counter = 0
+        return _orig_segments(video_path, segments)
+
+    clf.classify_frame = classify_frame
+    clf._classify_one = _classify_one
+    clf.classify_segments = classify_segments
+
+
 def load_segment_classifier(model_path: str, num_samples: int = 5,
                             verbose: bool = True):
     """Load a classification model and pair it with a mapping of its REAL names.
@@ -394,6 +444,7 @@ def load_segment_classifier(model_path: str, num_samples: int = 5,
     mapping = build_label_mapping(probe.class_names, model_path)
     clf = _MappedClassifier(model_path, mapping, num_samples=num_samples,
                             verbose=verbose)
+    _attach_sample_recorder(clf, mapping)
     if verbose:
         print(f"  [CLASSIFIER] {model_path}")
         print(f"      task={getattr(clf.model, 'task', '?')}  "

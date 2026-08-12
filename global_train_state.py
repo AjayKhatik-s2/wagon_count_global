@@ -372,6 +372,15 @@ class GlobalTrainState:
     classification_model_by_camera: Dict[str, str] = field(default_factory=dict)
     """Which classification model each camera used."""
 
+    temporal_classification: Dict[str, Any] = field(default_factory=dict)
+    """Per camera: raw vs stable class counts, every accepted AND rejected class
+    transition with its evidence, and the smoothed stable class intervals.
+    FIRST_VALID_WAGON / LAST_VALID_WAGON are derived from these intervals, never
+    from a single observation."""
+
+    temporal_classification_config: Dict[str, Any] = field(default_factory=dict)
+    """The hysteresis parameters used, so a run is reproducible."""
+
     top_classification_model_info: Dict[str, Any] = field(default_factory=dict)
     """The top model's REAL class names and the semantic mapping derived from
     them, including any unexpected classes (mapped to UNKNOWN, never WAGON)."""
@@ -428,6 +437,8 @@ class GlobalTrainState:
             "support_wagon_regions": dict(self.support_wagon_regions),
             "classification_model_by_camera": dict(self.classification_model_by_camera),
             "top_classification_model_info": dict(self.top_classification_model_info),
+            "temporal_classification": dict(self.temporal_classification),
+            "temporal_classification_config": dict(self.temporal_classification_config),
             "gap_validation_statistics": dict(self.gap_validation_statistics),
             "gap_validation_config": dict(self.gap_validation_config),
             "gap_rejection_details": dict(self.gap_rejection_details),

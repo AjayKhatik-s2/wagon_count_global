@@ -84,6 +84,7 @@ import global_alignment as ga
 import global_fusion as gf
 import gap_validation as gval
 import train_structure as ts
+import temporal_classification as tcls
 import video_segmenter as vs
 import evidence_report as er
 
@@ -286,6 +287,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    default=_gv.min_monotonic_fraction,
                    help=f"Min fraction of steps sharing the dominant direction "
                         f"(default: {_gv.min_monotonic_fraction})")
+
+    # ---- temporal classification -------------------------------------------
+    _tc = tcls.DEFAULT_TEMPORAL_CONFIG
+    p.add_argument("--no-temporal-classification", action="store_true",
+                   help="Trust each segment's own label instead of smoothing the "
+                        "class sequence temporally (previous behaviour). Off by "
+                        "default: a single low-confidence misclassification must "
+                        "not move a train-structure boundary.")
+    p.add_argument("--classification-switch-persistence", type=int,
+                   default=_tc.switch_persistence,
+                   help=f"Consecutive same-class observations that qualify a class "
+                        f"change when each is shorter than the minimum stable "
+                        f"region (default: {_tc.switch_persistence}; measured noise "
+                        f"bursts are 1 observation)")
+    p.add_argument("--classification-min-stable-sec", type=float,
+                   default=_tc.min_stable_region_s,
+                   help=f"Seconds of confidence-weighted evidence a challenger "
+                        f"class needs to take over (default: "
+                        f"{_tc.min_stable_region_s}; measured genuine regions are "
+                        f">=1.33s, noise bursts 0.33s)")
+    p.add_argument("--classification-min-challenge-conf", type=float,
+                   default=_tc.min_confidence_to_challenge,
+                   help=f"An observation below this confidence never counts as "
+                        f"evidence for a class change (default: "
+                        f"{_tc.min_confidence_to_challenge})")
 
     # ---- train structure ----------------------------------------------------
     p.add_argument("--no-wagon-only", action="store_true",
@@ -569,6 +595,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         traceback.print_exc()
         initial_classifications = []
 
+    # ---- STEP 2a: TEMPORAL SMOOTHING of the master class sequence ----
+    # FIRST_VALID_WAGON / LAST_VALID_WAGON are derived from the SMOOTHED
+    # sequence, never from a single observation's label.
+    tc_cfg = tcls.TemporalClassificationConfig(
+        enabled=not args.no_temporal_classification,
+        switch_persistence=int(args.classification_switch_persistence),
+        min_stable_region_s=float(args.classification_min_stable_sec),
+        min_confidence_to_challenge=float(args.classification_min_challenge_conf),
+    )
+    temporal_results: Dict[str, tcls.TemporalClassificationResult] = {}
+    if initial_classifications:
+        print()
+        print("-" * 70)
+        print("  STEP 2a  Temporal classification (segment-level hysteresis)")
+        print("-" * 70)
+        try:
+            initial_classifications, tres = tcls.apply_temporal_classification(
+                initial_classifications, master.fps, camera_id=CAMERA_RIGHT_UP,
+                cfg=tc_cfg, verbose=verbose,
+            )
+            temporal_results[CAMERA_RIGHT_UP] = tres
+        except Exception as e:
+            print(f"WARNING: temporal classification failed for "
+                  f"{CAMERA_RIGHT_UP}: {e}", file=sys.stderr)
+            _pending_notes.append(f"temporal_classification_failed:"
+                                  f"{CAMERA_RIGHT_UP}:{e}")
+
     # ------------------------------------------------------------------
     # STEP 2b -- SUPPORT-CAMERA CLASSIFICATION
     #
@@ -620,6 +673,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 labels: List[str] = []
                 if segs:
                     cls = clf.classify_segments(t.video_path, segs)
+                    # Same temporal smoothing on support cameras, so their local
+                    # wagon regions are not moved by a single bad observation.
+                    cls, tres = tcls.apply_temporal_classification(
+                        cls, t.fps, camera_id=cam, cfg=tc_cfg,
+                        sample_history=getattr(clf, "sample_history", None),
+                        verbose=verbose)
+                    temporal_results[cam] = tres
                     labels = [c.label for c in cls]
                 support_regions[cam] = ts.build_local_wagon_region(
                     cam, segs, labels, t.fps,
@@ -696,6 +756,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     }
     state.gap_validation_config = gv_cfg.describe()
     state.classification_model_by_camera = classification_models
+    state.temporal_classification = {
+        cam: tres.to_dict(include_samples=False)
+        for cam, tres in temporal_results.items()
+    }
+    state.temporal_classification_config = tc_cfg.describe()
     if top_label_mapping is not None:
         state.top_classification_model_info = top_label_mapping.to_dict()
     for note in _pending_notes:
