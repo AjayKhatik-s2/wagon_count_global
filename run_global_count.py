@@ -88,10 +88,10 @@ import train_structure as ts
 import temporal_classification as tcls
 import video_segmenter as vs
 import evidence_report as er
-import inspection as insp
-from inspection import detection as insp_detect
-from inspection import evidence as insp_evidence
-from inspection import models as insp_models
+from inspection import old_features as oldf
+from inspection import old_report as oldr
+from inspection import wagon_cache as iwc
+from core import global_state_loader as core_state
 
 
 # =============================================================================
@@ -255,7 +255,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Frames per segment for side_classification.pt vote (default: 5)")
 
     # ---- inspection: DOWNSTREAM features on the finished global train --------
-    _ic = insp.InspectionConfig()
     p.add_argument("--no-inspection", action="store_true",
                    help="Skip door/top-damage inspection entirely. The wagon "
                         "count is unaffected either way.")
@@ -263,20 +262,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to door_state.pt (default: <models-dir>/door_state.pt)")
     p.add_argument("--damage-model", default=None,
                    help="Path to top_damage.pt (default: <models-dir>/top_damage.pt)")
-    p.add_argument("--inspection-confidence", type=float,
-                   default=_ic.min_detection_confidence,
-                   help="Detection floor for admitting a raw inspection detection "
-                        f"into tracking (default {_ic.min_detection_confidence})")
-    p.add_argument("--inspection-stride", type=int, default=_ic.frame_stride,
-                   help=f"Inspect every Nth frame (default {_ic.frame_stride})")
-    p.add_argument("--inspection-min-track-sec", type=float,
-                   default=_ic.min_track_seconds,
-                   help="Persistence in SECONDS required to confirm a finding "
-                        f"(default {_ic.min_track_seconds})")
-    p.add_argument("--inspection-min-peak-conf", type=float,
-                   default=_ic.min_peak_confidence,
-                   help="Peak confidence a confirmed finding must reach "
-                        f"(default {_ic.min_peak_confidence})")
+    p.add_argument("--no-door", action="store_true",
+                   help="Skip the door feature (old_code DoorTracker path)")
+    p.add_argument("--no-load", action="store_true",
+                   help="Skip the load feature (needs load.pt; supplied on EC2)")
+    p.add_argument("--no-damage", action="store_true",
+                   help="Skip the top-damage feature (old_code DamageTracker path)")
+    p.add_argument("--keep-wagon-cache", action="store_true",
+                   help="Keep wagon_cache/ after inspection. Off by default: the "
+                        "cache is per-train state and must not be read by the "
+                        "next train.")
+    p.add_argument("--wagon-cache-every-nth", type=int,
+                   default=iwc.WagonCacheConfig().every_nth,
+                   help="Cache every Nth frame inside each wagon window "
+                        f"(default {iwc.WagonCacheConfig().every_nth})")
+    p.add_argument("--wagon-cache-max-frames", type=int,
+                   default=iwc.WagonCacheConfig().max_frames_per_wagon,
+                   help="Ceiling on cached frames per (wagon, camera) "
+                        f"(default {iwc.WagonCacheConfig().max_frames_per_wagon})")
 
     # ---- fragment reassembly: rebuild physical gaps before validating them ---
     _fs = fstitch.DEFAULT_FRAGMENT_STITCH
@@ -586,24 +589,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ------------------------------------------------------------------
     # Inspection model availability, resolved UP FRONT.
     #
-    # Deliberately before any video is touched: a missing or unloadable
-    # inspection model must be visible now, not after half an hour of tracking.
-    # Classes are read from the checkpoints and printed, so a silent class
-    # mismatch is impossible -- nothing downstream assumes what they are.
+    # Before any video is decoded, so a missing weight is visible now rather than
+    # after half an hour of tracking. Classes are read from each checkpoint and
+    # printed -- nothing downstream assumes them -- and for load the
+    # label->state mapping is resolved from the model's real class names.
     # ------------------------------------------------------------------
-    model_availability: Dict[str, insp_models.ModelAvailability] = {}
     if not args.no_inspection:
-        print("-" * 70)
-        print("  INSPECTION MODELS")
-        print("-" * 70)
-        model_availability = insp_models.discover_models(
-            models_dir=args.models_dir,
-            door_path=args.door_model, damage_path=args.damage_model)
-        print(insp_models.describe_model_availability(model_availability))
-        if not any(a.is_available for a in model_availability.values()):
-            print("  NOTE: no inspection model is available -- the wagon count "
-                  "will still be produced in full, and the report will record "
-                  "the inspection stage as unavailable.", file=sys.stderr)
+        oldf.discover_feature_models(args.models_dir, verbose=True)
         print()
 
     os.makedirs(args.output, exist_ok=True)
@@ -1031,87 +1023,95 @@ def main(argv: Optional[List[str]] = None) -> int:
         state.add_note(note)
 
     # ------------------------------------------------------------------
-    # STEPS 8-11 -- INSPECTION (door state, top damage)
+    # STEPS 8-11 -- INSPECTION  (door / load / damage, from old_code)
     #
-    # Runs only now, AFTER the global wagon roster and GW ids are final. That
-    # ordering is the safety property: inspection reads `state.wagons` and
-    # `state.camera_offsets` and writes neither, so no detection can create,
-    # delete or renumber a wagon, move a boundary or disturb MASTER == GLOBAL.
+    # Runs ONLY here, after the global wagon roster and GW ids are final. The
+    # mature door / load / damage algorithms are old_code's own and are invoked
+    # UNCHANGED through the `features` shim; this stage only supplies them with
+    # per-wagon frames and fuses their output.
     #
-    # A wagon count that already succeeded must never be lost to an inspection
-    # problem, so every failure here degrades to a recorded warning.
+    # Three protections apply:
+    #   * the roster is hashed before and after, and a mismatch raises -- so
+    #     "inspection cannot change the count" is checked, not asserted;
+    #   * association is by construction, via wagon_cache/<GW_n>/<camera>/, so a
+    #     detection cannot be attributed to the wrong wagon or invent one;
+    #   * any inspection failure degrades to a warning, because a wagon count
+    #     that already succeeded must never be lost to a downstream feature.
     # ------------------------------------------------------------------
-    inspection_state = None
+    inspection_result = None
+    report_paths: Dict[str, Any] = {}
     if not args.no_inspection:
         print()
         print("-" * 70)
-        print("  STEPS 8-11  Inspection (door state, top damage)")
+        print("  STEPS 8-11  Inspection (door / load / damage from old_code)")
         print("-" * 70)
         _insp_t0 = time.time()
+        _roster_before = core_state.roster_hash(state)
         try:
-            insp_cfg = insp.InspectionConfig(
+            insp_cfg = oldf.OldInspectionConfig(
                 enabled=True,
-                min_detection_confidence=float(args.inspection_confidence),
-                frame_stride=int(args.inspection_stride),
-                min_track_seconds=float(args.inspection_min_track_sec),
-                min_peak_confidence=float(args.inspection_min_peak_conf),
+                keep_cache=bool(args.keep_wagon_cache),
+                run_door=not args.no_door,
+                run_load=not args.no_load,
+                run_damage=not args.no_damage,
+                cache=iwc.WagonCacheConfig(
+                    every_nth=int(args.wagon_cache_every_nth),
+                    max_frames_per_wagon=int(args.wagon_cache_max_frames)),
             )
-            count_before = len(state.wagons)
-            ids_before = [w.global_id for w in state.wagons]
-
-            inspection_state = insp_detect.run_inspection(
+            inspection_result = oldf.run_old_inspection(
                 state=state, tracks_by_camera=tracks,
-                availability=model_availability, all_cameras=ALL_CAMERAS,
+                models_dir=args.models_dir, output_root=args.output,
                 cfg=insp_cfg, verbose=verbose)
 
-            # Inspection is additive by construction; assert it, so a future
-            # change that breaks the guarantee fails loudly here rather than
-            # silently shipping a wrong count.
-            if len(state.wagons) != count_before or \
-                    [w.global_id for w in state.wagons] != ids_before:
-                raise AssertionError(
-                    "inspection altered the global wagon roster -- it must only "
-                    "annotate wagons that already exist")
+            _s = inspection_result.to_dict()["summary"]
+            print()
+            print(f"  wagons inspected          : {len(inspection_result.unified)}")
+            print(f"  L doors OPEN / PARTIAL    : {_s['left_doors_open']} / "
+                  f"{_s['left_doors_partial']}")
+            print(f"  R doors OPEN / PARTIAL    : {_s['right_doors_open']} / "
+                  f"{_s['right_doors_partial']}")
+            print(f"  doors DAMAGED             : {_s['doors_damaged']}")
+            print(f"  LOADED / EMPTY / NO_DATA  : {_s['loaded']} / {_s['empty']} / "
+                  f"{_s['load_no_data']}")
+            print(f"  top damaged               : {_s['top_damaged']}")
+            print(f"  anomaly wagons            : {_s['anomaly_wagons']}")
+            for w in inspection_result.warnings:
+                print(f"  NOTE: {w}")
 
-            # Evidence: select frames deterministically, then extract images.
-            insp_evidence.attach_evidence(
-                inspection_state.events, inspection_state.tracks_by_key, insp_cfg)
-            if not args.no_report:
-                _ev_dir = os.path.join(args.output, "inspection_evidence")
-                n_img = insp_evidence.extract_evidence_images(
-                    inspection_state.events,
-                    {cam: tracks[cam].video_path for cam in ALL_CAMERAS},
-                    _ev_dir, verbose=verbose)
-                inspection_state.timings["evidence_seconds"] = round(
-                    time.time() - _insp_t0, 2)
-                if verbose:
-                    print(f"    [EVIDENCE] {n_img} inspection evidence frame(s) "
-                          f"-> {_ev_dir}")
-            _c = inspection_state.counts()
-            print(f"  confirmed door findings   : {_c['confirmed_door_events']}")
-            print(f"  confirmed damage findings : {_c['confirmed_damage_events']}")
-            print(f"  rejected candidates       : {_c['rejected_events']}")
-            print(f"  unresolved associations   : {_c['unresolved_associations']}")
-            print(f"  association status        : "
-                  f"{inspection_state.association_status()}")
+            # ---- reports: old combined report + per-camera reports ----------
+            if not args.no_report and inspection_result.unified:
+                report_paths = oldr.build_all_reports(
+                    state=state, unified=inspection_result.unified,
+                    output_root=args.output,
+                    batch_key=os.path.basename(os.path.abspath(args.output)),
+                    camera_status=inspection_result.camera_status,
+                    verbose=verbose)
         except Exception as exc:
             msg = (f"inspection stage failed: {type(exc).__name__}: {exc} -- "
                    f"the wagon count above is unaffected")
             print(f"WARNING: {msg}", file=sys.stderr)
             state.add_note(msg)
-            if inspection_state is not None:
-                inspection_state.warnings.append(msg)
+            traceback.print_exc(limit=3)
         finally:
-            _insp_elapsed = time.time() - _insp_t0
-            if inspection_state is not None:
-                inspection_state.timings["total_seconds"] = round(_insp_elapsed, 2)
-            print(f"  inspection elapsed        : {_insp_elapsed:.1f}s")
+            # The checked guarantee, enforced even if a feature raised.
+            core_state.assert_roster_unchanged(state, _roster_before)
+            _elapsed = time.time() - _insp_t0
+            if inspection_result is not None:
+                inspection_result.timings["total_seconds"] = _elapsed
+            print(f"  inspection elapsed        : {_elapsed:.1f}s")
     else:
         print()
         print("  Inspection SKIPPED (--no-inspection)")
 
-    if inspection_state is not None:
-        state.inspection = inspection_state.to_dict()
+    if inspection_result is not None:
+        state.inspection = inspection_result.to_dict()
+        if report_paths:
+            state.inspection["reports"] = {
+                "combined_json": (report_paths.get("combined") or {}).get("json_path"),
+                "combined_pdf": (report_paths.get("combined") or {}).get("pdf_path"),
+                "camera_pdfs": {k: v for k, v in
+                                (report_paths.get("cameras") or {}).items()},
+            }
 
     # ------------------------------------------------------------------
     # STEP 4 -- write JSON
@@ -1167,7 +1167,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     time_offset=offsets.get(cam, 0.0),
                     drop_out_of_range=(state.fusion_mode == "master-fixed"),
                     non_wagon_regions=non_wagon_regions,
-                    inspection_events=((state.inspection or {}).get("events") or []),
+                    inspection_state=(state.inspection or {}),
                 )
             except Exception as e:
                 print(f"WARNING: render failed for {cam}: {e}", file=sys.stderr)

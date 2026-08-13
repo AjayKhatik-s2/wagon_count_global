@@ -205,7 +205,7 @@ def render_processed_video(
     time_offset: float = 0.0,
     drop_out_of_range: bool = False,
     non_wagon_regions: Optional[List[Dict]] = None,
-    inspection_events: Optional[List[Dict]] = None,
+    inspection_state: Optional[Dict] = None,
 ) -> str:
     """Render the overlay video for ONE camera.
 
@@ -225,12 +225,12 @@ def render_processed_video(
     drop_out_of_range :
         When True, global wagons outside this camera's footage are not drawn at
         all rather than being clamped onto the final frame.
-    inspection_events :
-        Confirmed door / top-damage findings for THIS camera, already associated
-        to a GW id upstream.  Drawn from the finished inspection record, so the
-        video and the PDF report always state the same finding for the same
-        wagon.  Purely additive: the gap and wagon overlays are untouched, and no
-        detection drawn here can alter a GW id.
+    inspection_state :
+        The persisted inspection record (``state.inspection``) produced by the
+        door / load / damage stage.  Rendering CONSUMES this; it never re-runs
+        inference, so the video, the JSON and the PDF cannot disagree.  Purely
+        additive: the gap and wagon overlays are untouched, and nothing drawn
+        here can alter a GW id.
     non_wagon_regions :
         Leading / trailing / interior ENGINE and BRAKE_VAN regions in MASTER
         time, as produced by ``train_structure.WagonWindow.summary()``. The full
@@ -292,12 +292,26 @@ def render_processed_video(
         print(f"  {local_tracks.total_frames} frames, {len(state.wagons)} wagons projected")
 
     frame_idx = 0
-    # Index this camera's confirmed findings by frame span, once. Kept as plain
-    # numbers so the draw loop never holds anything image-sized.
-    _insp_by_camera: List[Dict] = [
-        e for e in (inspection_events or [])
-        if e.get("camera_id") == local_tracks.camera_id and e.get("confirmed", True)
-    ]
+    # ---- persisted inspection state -> draw-time lookups, built ONCE --------
+    #
+    # The renderer never runs a model. It reads the inspection record the feature
+    # stage already wrote, so the video, the JSON and the PDF always state the
+    # same verdict for the same wagon.
+    #
+    # Two lookups: per-wagon verdicts (door / load / damage, keyed by GW id) and
+    # per-frame damage boxes for THIS camera. Both are plain numbers and strings,
+    # so the draw loop holds nothing image-sized.
+    _insp = inspection_state or {}
+    _insp_wagons: Dict[str, Dict] = dict(_insp.get("wagons") or {})
+    _damage_boxes: Dict[int, List[Dict]] = {}
+    for _gid, _rec in _insp_wagons.items():
+        for _det in (_rec.get("evidence") or {}).get("damage") or []:
+            if _det.get("camera_id") != local_tracks.camera_id:
+                continue
+            _fi = _det.get("frame_idx")
+            if _fi is None:
+                continue
+            _damage_boxes.setdefault(int(_fi), []).append({**_det, "global_id": _gid})
 
     while True:
         ret, frame = cap.read()
@@ -405,36 +419,47 @@ def render_processed_video(
         if state.fallback_used:
             info_lines.append(("FALLBACK MODE (pure RIGHT_UP)", (0, 0, 255)))
 
-        # ---- inspection overlays (additive) ----------------------------
-        _active_findings = [e for e in _insp_by_camera
-                            if e.get("start_frame", 0) <= frame_idx
-                            <= e.get("end_frame", -1)]
-        for _ev in _active_findings:
-            _bbox = _ev.get("peak_bbox")
-            if _bbox:
-                x1, y1, x2, y2 = (int(v) for v in _bbox)
-                _col = (_DOOR_BOX_COLOR if _ev.get("role") == "door"
-                        else _DAMAGE_BOX_COLOR)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), _col, 2)
-                _gw = _ev.get("global_id") or "UNRESOLVED"
-                cv2.putText(frame, _gw, (x1 + 4, max(16, y1 - 22)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, _col, 2, cv2.LINE_AA)
-                cv2.putText(frame,
-                            f"{_ev.get('model_class_name', '?')} "
-                            f"{float(_ev.get('peak_confidence', 0.0)):.2f}",
-                            (x1 + 4, max(30, y1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, _col, 2, cv2.LINE_AA)
-        # One line per role in the panel, so a reviewer sees the attribution
-        # without the frame becoming unreadable.
-        for _role, _label, _col in (("door", "Door", _DOOR_BOX_COLOR),
-                                    ("top_damage", "Top damage", _DAMAGE_BOX_COLOR)):
-            _hits = [e for e in _active_findings if e.get("role") == _role]
-            if _hits:
-                _b = max(_hits, key=lambda e: float(e.get("peak_confidence", 0.0)))
+        # ---- inspection overlays (additive; counting overlays untouched) ----
+        #
+        # Old visual semantics preserved: the per-wagon verdict is stated in the
+        # panel next to the wagon it belongs to, and damage detections are drawn
+        # as boxes with their model class name and confidence. Amber = door,
+        # red = damage, so a reviewer can tell an inspection finding from a
+        # counting overlay at a glance.
+        _rec = (_insp_wagons.get(current_wagon.global_id)
+                if current_wagon is not None else None)
+        if _rec is not None:
+            _gw = current_wagon.global_id
+            for _label, _key, _conf_key in (
+                    ("L door", "left_door", "left_door_confidence"),
+                    ("R door", "right_door", "right_door_confidence"),
+                    ("Load", "load_status", "load_confidence"),
+                    ("Top damage", "top_damage", "top_damage_confidence")):
+                _val = _rec.get(_key)
+                if not _val or _val == "NO_DATA":
+                    continue
+                _c = float(_rec.get(_conf_key, 0.0) or 0.0)
+                _anom = _val in ("OPEN", "PARTIAL", "DAMAGED", "DAMAGE")
                 info_lines.append((
-                    f"{_label + ':':<21} {_b.get('model_class_name', '?')} "
-                    f"{float(_b.get('peak_confidence', 0.0)):.2f}  "
-                    f"[{_b.get('global_id') or 'UNRESOLVED'}]", _col))
+                    f"{_label + ':':<21} {_val}"
+                    + (f" ({_c:.2f})" if _c > 0 else "")
+                    + f"  [{_gw}]",
+                    _DAMAGE_BOX_COLOR if _anom else _DOOR_BOX_COLOR))
+
+        for _det in _damage_boxes.get(frame_idx, []):
+            _bb = _det.get("bbox")
+            if not _bb or len(_bb) != 4:
+                continue
+            x1, y1, x2, y2 = (int(v) for v in _bb)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), _DAMAGE_BOX_COLOR, 2)
+            cv2.putText(frame, str(_det.get("global_id") or "UNRESOLVED"),
+                        (x1 + 4, max(16, y1 - 22)), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, _DAMAGE_BOX_COLOR, 2, cv2.LINE_AA)
+            cv2.putText(frame,
+                        f"{_det.get('class_name', '?')} "
+                        f"{float(_det.get('confidence', 0.0) or 0.0):.2f}",
+                        (x1 + 4, max(30, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, _DAMAGE_BOX_COLOR, 2, cv2.LINE_AA)
 
         _draw_info_panel(frame, info_lines)
 

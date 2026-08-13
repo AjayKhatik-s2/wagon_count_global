@@ -1,75 +1,41 @@
-"""Downstream inspection features attached to an ALREADY-BUILT global train.
+"""Downstream inspection: old_code intelligence on the finalized global wagons.
 
-    ALL CAMERA VIDEOS
-           |
-           v
-    GLOBAL TRAIN STRUCTURE      <-- built by the counting pipeline, PROTECTED
-           |
-      +----+----+
-      |         |
-      v         v
-  GW IDs   GLOBAL TIMELINE
-      |
-      +---------------+
-      |               |
-      v               v
-  DOOR            TOP DAMAGE
-      |               |
-      +-------+-------+
-              |
-              v
-    GLOBAL INSPECTION STATE
-              |
-       +------+------+
-       |             |
-       v             v
-     PDF        PROCESSED VIDEOS
+    GLOBAL TRAIN STRUCTURE (protected)
+        -> FINAL GW_1..GW_N
+        -> wagon_cache/<GW_n>/<camera>/      association by construction
+        -> old_code door / load / damage     imported UNCHANGED
+        -> UnifiedWagonState per GW_n
+        -> additive state.inspection
+        -> old combined report + camera reports
+        -> processed videos
 
-THE ONE RULE THIS PACKAGE OBEYS
--------------------------------
-The global wagon roster is the source of truth and is READ-ONLY here. Nothing in
-this package can create a wagon, delete a wagon, renumber a GW id, alter a gap,
-a boundary, a camera offset or the MASTER == GLOBAL invariant. Inspection
-findings are annotations on a structure that already exists.
+THERE IS EXACTLY ONE IMPLEMENTATION OF THE FEATURE INTELLIGENCE, and it lives in
+`old_code/`. This package contains only the bridge: the per-wagon frame cache that
+performs GW association, the orchestrator that calls the old processors in the
+right order, and the report entry points. No detection, tracking, filtering,
+voting or state-machine logic is reimplemented here -- an earlier simplified
+version was removed precisely so it could not drift from the source of truth.
 
-That is enforced structurally, not by convention: association resolves a
-detection to a GW id by LOOKUP into the finished wagon roster, and a detection
-that resolves to nothing is recorded as unresolved rather than given a wagon of
-its own.
-
-WHY THE TRACKING HERE MIRRORS THE GAP PIPELINE
-----------------------------------------------
-Measured on real video, an inspection detection behaves exactly like a gap
-candidate: a genuine door was detected across 28 consecutive frames with its
-centre advancing ~28 px/frame -- the train's own speed -- while false positives
-appeared as 1-5 frame runs at low confidence, several of them PINNED near the
-frame edge. So the same principles that made gap counting reliable apply:
-temporal persistence, motion consistent with the train, static rejection, and
-confidence-weighted class voting rather than trusting one frame.
+OCR is out of scope.
 """
 
-from __future__ import annotations
-
-from .models import (
-    InspectionModel, ModelAvailability, ModelSpec, discover_models,
-    describe_model_availability,
+from .wagon_cache import (
+    CACHE_DIRNAME, CachePlan, WagonCacheConfig, WagonWindow, build_wagon_cache,
+    cache_stats, clear_wagon_cache, plan_cache, wagon_camera_dir,
 )
-from .state import (
-    ASSOCIATION_AMBIGUOUS, ASSOCIATION_RESOLVED, ASSOCIATION_UNRESOLVED,
-    CAMERA_NOT_APPLICABLE, CAMERA_NOT_VISIBLE, CAMERA_NO_DETECTION,
-    CAMERA_CONFIRMED, CAMERA_UNRESOLVED,
-    InspectionConfig, InspectionEvent, InspectionState, WagonInspection,
+from .old_features import (
+    OldInspectionConfig, OldInspectionResult, discover_feature_models,
+    fuse_unified_states, run_old_inspection,
 )
-from .tracking import DetectionObservation, InspectionTrack, track_detections
-from .association import associate_tracks_to_wagons
+from .old_report import (
+    build_all_reports, build_camera_reports, build_combined_report,
+)
 
 __all__ = [
-    "InspectionModel", "ModelAvailability", "ModelSpec", "discover_models",
-    "describe_model_availability",
-    "InspectionConfig", "InspectionEvent", "InspectionState", "WagonInspection",
-    "DetectionObservation", "InspectionTrack", "track_detections",
-    "associate_tracks_to_wagons",
-    "ASSOCIATION_RESOLVED", "ASSOCIATION_UNRESOLVED", "ASSOCIATION_AMBIGUOUS",
-    "CAMERA_CONFIRMED", "CAMERA_NO_DETECTION", "CAMERA_NOT_VISIBLE",
-    "CAMERA_UNRESOLVED", "CAMERA_NOT_APPLICABLE",
+    "WagonCacheConfig", "WagonWindow", "CachePlan", "plan_cache",
+    "build_wagon_cache", "cache_stats", "clear_wagon_cache", "wagon_camera_dir",
+    "CACHE_DIRNAME",
+    "OldInspectionConfig", "OldInspectionResult", "run_old_inspection",
+    "discover_feature_models", "fuse_unified_states",
+    "build_all_reports", "build_camera_reports", "build_combined_report",
 ]

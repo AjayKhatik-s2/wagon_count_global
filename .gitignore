@@ -157,3 +157,6 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+__pycache__/
+*.pyc
