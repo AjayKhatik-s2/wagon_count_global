@@ -98,6 +98,143 @@ class TestRawDetectionCannotBecomeGlobalGap(unittest.TestCase):
 
 
 # ===========================================================================
+# CLI / CONFIG COMPATIBILITY
+#
+# Regression: the CLI read `_gv.min_track_frames` after that attribute had been
+# replaced by `min_track_seconds`, so the pipeline died in argparse before
+# touching a video:
+#     AttributeError: 'GapValidationConfig' object has no attribute
+#     'min_track_frames'. Did you mean: 'min_track_seconds'?
+# py_compile did not catch it (attribute access is runtime) and no test built the
+# parser. These tests build it, so the class of bug cannot recur.
+# ===========================================================================
+
+class TestCliConfigCompatibility(unittest.TestCase):
+    def _parser(self):
+        import run_global_count as rgc
+        return rgc._build_arg_parser()
+
+    def test_parser_builds_at_all(self):
+        """Building the parser touches every `default=` expression."""
+        self.assertIsNotNone(self._parser())
+
+    def test_parses_with_no_arguments(self):
+        args = self._parser().parse_args([])
+        self.assertIsNotNone(args.gap_min_track_sec)
+        self.assertIsNotNone(args.gap_static_max_frac)
+
+    def test_every_gap_default_matches_the_config(self):
+        args = self._parser().parse_args([])
+        c = gval.DEFAULT_GAP_VALIDATION
+        self.assertEqual(args.gap_min_track_sec, c.min_track_seconds)
+        self.assertEqual(args.gap_max_track_gap_sec, c.max_detection_gap_seconds)
+        self.assertEqual(args.gap_min_motion_frac, c.min_motion_frac)
+        self.assertEqual(args.gap_static_max_frac, c.static_max_motion_frac)
+        self.assertEqual(args.gap_min_motion_frac_sec, c.min_motion_frac_per_sec)
+        self.assertEqual(args.gap_max_motion_frac_sec, c.max_motion_frac_per_sec)
+        self.assertEqual(args.gap_min_separation_sec, c.min_separation_seconds)
+        self.assertEqual(args.gap_motion_tolerance, c.train_motion_tolerance)
+        self.assertEqual(args.gap_min_confidence, c.min_mean_confidence)
+
+    def test_every_cli_default_is_a_real_config_attribute(self):
+        """Any `default=_gv.X` where X was renamed would fail here."""
+        c = gval.GapValidationConfig()
+        for name in ("min_track_seconds", "max_detection_gap_seconds",
+                     "min_motion_frac", "static_max_motion_frac",
+                     "min_motion_frac_per_sec", "max_motion_frac_per_sec",
+                     "min_separation_seconds", "train_motion_tolerance",
+                     "min_mean_confidence", "min_monotonic_fraction"):
+            self.assertTrue(hasattr(c, name), f"config lost attribute {name}")
+
+    def test_config_can_be_constructed_from_parsed_args(self):
+        """The exact construction main() performs."""
+        args = self._parser().parse_args([])
+        cfg = gval.GapValidationConfig(
+            enabled=not args.no_gap_validation,
+            min_track_seconds=float(args.gap_min_track_sec),
+            max_detection_gap_seconds=float(args.gap_max_track_gap_sec),
+            min_motion_frac=float(args.gap_min_motion_frac),
+            static_max_motion_frac=float(args.gap_static_max_frac),
+            min_motion_frac_per_sec=float(args.gap_min_motion_frac_sec),
+            max_motion_frac_per_sec=float(args.gap_max_motion_frac_sec),
+            min_separation_seconds=float(args.gap_min_separation_sec),
+            min_monotonic_fraction=float(args.gap_min_monotonic),
+            min_mean_confidence=float(args.gap_min_confidence),
+            train_motion_tolerance=float(args.gap_motion_tolerance),
+        )
+        self.assertTrue(cfg.enabled)
+        self.assertGreater(cfg.resolve(848, 15.0).min_track_frames, 0)
+
+    def test_normalized_flags_take_effect(self):
+        args = self._parser().parse_args(
+            ["--gap-min-track-sec", "0.5", "--gap-static-max-frac", "0.02"])
+        cfg = gval.GapValidationConfig(
+            min_track_seconds=args.gap_min_track_sec,
+            static_max_motion_frac=args.gap_static_max_frac)
+        r = cfg.resolve(848, 15.0)
+        self.assertEqual(r.min_track_frames, 8)          # 0.5 s * 15 fps
+        self.assertAlmostEqual(r.static_max_motion_px, 0.02 * 848, places=3)
+
+    def test_deprecated_absolute_flags_default_to_none(self):
+        args = self._parser().parse_args([])
+        for attr in ("gap_min_track_frames", "gap_max_track_gap",
+                     "gap_min_motion_px", "gap_static_max_px",
+                     "gap_min_motion_px_sec", "gap_max_motion_px_sec"):
+            self.assertIsNone(getattr(args, attr),
+                              f"{attr} must default to None so it only acts as an "
+                              f"explicit override")
+
+    def test_deprecated_absolute_flags_still_parse_and_override(self):
+        """Backward compatibility: an old EC2 command line keeps working."""
+        args = self._parser().parse_args(
+            ["--gap-min-track-frames", "7", "--gap-min-motion-px", "30",
+             "--gap-static-max-px", "9"])
+        self.assertEqual(args.gap_min_track_frames, 7)
+        overrides = {"min_track_frames": float(args.gap_min_track_frames),
+                     "min_motion_px": float(args.gap_min_motion_px),
+                     "static_max_motion_px": float(args.gap_static_max_px)}
+        r = gval.GapValidationConfig().resolve(848, 15.0, overrides)
+        self.assertEqual(r.min_track_frames, 7)
+        self.assertEqual(r.min_motion_px, 30.0)
+        self.assertEqual(r.static_max_motion_px, 9.0)
+
+    def test_override_does_not_mutate_the_config(self):
+        """An absolute override must stay per-camera, never persist."""
+        cfg = gval.GapValidationConfig()
+        before = cfg.describe()
+        cfg.resolve(848, 15.0, {"min_motion_px": 999.0})
+        self.assertEqual(cfg.describe(), before)
+        # ...and the next camera resolves from the normalized value again
+        self.assertAlmostEqual(cfg.resolve(848, 15.0).min_motion_px,
+                               cfg.min_motion_frac * 848, places=3)
+
+    def test_override_of_unknown_threshold_is_rejected(self):
+        with self.assertRaises(ValueError):
+            gval.GapValidationConfig().resolve(848, 15.0, {"not_a_threshold": 1.0})
+
+    def test_override_applies_through_validate_gap_events(self):
+        xs = [700.0 - 35.0 * i for i in range(13)]
+        g = GapEvent(track_id=1, camera_id=CAMERA_RIGHT_UP, start_frame=100,
+                     end_frame=112, confidence=0.9, hit_count=13,
+                     center_x_trajectory=xs, fps=FPS,
+                     hit_frames=list(range(100, 113)))
+        ok = gval.validate_gap_events([g], CAMERA_RIGHT_UP, verbose=False,
+                                      frame_width=848, fps=FPS)
+        self.assertEqual(len(ok.accepted), 1)
+        # An absurd absolute override must actually bite.
+        strict = gval.validate_gap_events([g], CAMERA_RIGHT_UP, verbose=False,
+                                          frame_width=848, fps=FPS,
+                                          absolute_overrides={"min_motion_px": 5000.0})
+        self.assertEqual(strict.accepted, [])
+        self.assertEqual(strict.resolved_thresholds["min_motion_px"], 5000.0)
+
+    def test_no_absolute_units_remain_in_the_config(self):
+        for key in gval.GapValidationConfig().describe():
+            self.assertFalse(key.endswith("_px") or key.endswith("_frames"),
+                             f"{key} reintroduces absolute units into the config")
+
+
+# ===========================================================================
 # MULTI-TRAIN SAFETY: geometry resolution
 # ===========================================================================
 

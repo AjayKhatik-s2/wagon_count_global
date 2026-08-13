@@ -254,22 +254,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-gap-validation", action="store_true",
                    help="Disable motion/temporal gap validation and treat every "
                         "tracked candidate as a wagon boundary (previous behaviour)")
-    p.add_argument("--gap-min-track-frames", type=int, default=_gv.min_track_frames,
-                   help=f"Min track extent in frames (default: {_gv.min_track_frames})")
-    p.add_argument("--gap-min-motion-px", type=float, default=_gv.min_motion_px,
-                   help=f"Min centre displacement over the track, px "
-                        f"(default: {_gv.min_motion_px}; smallest real gap measured "
-                        f"110.7 px)")
-    p.add_argument("--gap-static-max-px", type=float, default=_gv.static_max_motion_px,
-                   help=f"At or below this displacement a track is REJECTED_STATIC "
-                        f"(default: {_gv.static_max_motion_px}; measured false "
-                        f"positives moved <= 0.2 px)")
-    p.add_argument("--gap-min-motion-px-sec", type=float,
-                   default=_gv.min_motion_px_per_sec,
-                   help=f"Min apparent speed, px/s (default: {_gv.min_motion_px_per_sec})")
-    p.add_argument("--gap-max-motion-px-sec", type=float,
-                   default=_gv.max_motion_px_per_sec,
-                   help=f"Max apparent speed, px/s (default: {_gv.max_motion_px_per_sec})")
+    # Primary flags are CAMERA-INDEPENDENT: seconds for durations, fractions of
+    # frame width for distances. They are resolved to this camera's pixels and
+    # frames at runtime, so one setting behaves the same on every train and every
+    # camera geometry.
+    p.add_argument("--gap-min-track-sec", type=float, default=_gv.min_track_seconds,
+                   help=f"Min track extent in SECONDS "
+                        f"(default: {_gv.min_track_seconds})")
+    p.add_argument("--gap-max-track-gap-sec", type=float,
+                   default=_gv.max_detection_gap_seconds,
+                   help=f"Longest blind run tolerated inside one track, SECONDS "
+                        f"(default: {_gv.max_detection_gap_seconds})")
+    p.add_argument("--gap-min-motion-frac", type=float, default=_gv.min_motion_frac,
+                   help=f"Min centre displacement as a FRACTION OF FRAME WIDTH "
+                        f"(default: {_gv.min_motion_frac})")
+    p.add_argument("--gap-static-max-frac", type=float,
+                   default=_gv.static_max_motion_frac,
+                   help=f"At or below this displacement (FRACTION OF FRAME WIDTH) a "
+                        f"track is REJECTED_STATIC "
+                        f"(default: {_gv.static_max_motion_frac})")
+    p.add_argument("--gap-min-motion-frac-sec", type=float,
+                   default=_gv.min_motion_frac_per_sec,
+                   help=f"Min apparent speed, FRAME WIDTHS per second "
+                        f"(default: {_gv.min_motion_frac_per_sec})")
+    p.add_argument("--gap-max-motion-frac-sec", type=float,
+                   default=_gv.max_motion_frac_per_sec,
+                   help=f"Max apparent speed, FRAME WIDTHS per second "
+                        f"(default: {_gv.max_motion_frac_per_sec})")
+    p.add_argument("--gap-min-separation-sec", type=float,
+                   default=_gv.min_separation_seconds,
+                   help=f"Minimum time between consecutive VALIDATED gap events, "
+                        f"SECONDS (default: {_gv.min_separation_seconds})")
     p.add_argument("--gap-motion-tolerance", type=float,
                    default=_gv.train_motion_tolerance,
                    help=f"Max factor by which a gap's speed may differ from its "
@@ -279,10 +294,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help=f"Min mean track confidence (default: "
                         f"{_gv.min_mean_confidence}; the per-frame detector "
                         f"threshold is unchanged)")
-    p.add_argument("--gap-max-track-gap", type=int,
-                   default=_gv.max_detection_gap_frames,
-                   help=f"Longest blind run tolerated inside one track, frames "
-                        f"(default: {_gv.max_detection_gap_frames})")
+
+    # ---- DEPRECATED absolute-unit flags -------------------------------------
+    # Kept so existing EC2 invocations keep working. They default to None and are
+    # applied as PER-CAMERA overrides at validation time, converted with that
+    # camera's own width/fps -- the config itself never stores absolute units, so
+    # an absolute value given for one geometry cannot leak into another.
+    p.add_argument("--gap-min-track-frames", type=int, default=None,
+                   help="DEPRECATED: use --gap-min-track-sec. Absolute frame "
+                        "count, applied per camera as an override.")
+    p.add_argument("--gap-max-track-gap", type=int, default=None,
+                   help="DEPRECATED: use --gap-max-track-gap-sec.")
+    p.add_argument("--gap-min-motion-px", type=float, default=None,
+                   help="DEPRECATED: use --gap-min-motion-frac.")
+    p.add_argument("--gap-static-max-px", type=float, default=None,
+                   help="DEPRECATED: use --gap-static-max-frac.")
+    p.add_argument("--gap-min-motion-px-sec", type=float, default=None,
+                   help="DEPRECATED: use --gap-min-motion-frac-sec.")
+    p.add_argument("--gap-max-motion-px-sec", type=float, default=None,
+                   help="DEPRECATED: use --gap-max-motion-frac-sec.")
     p.add_argument("--gap-min-monotonic", type=float,
                    default=_gv.min_monotonic_fraction,
                    help=f"Min fraction of steps sharing the dominant direction "
@@ -545,18 +575,42 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("-" * 70)
     print("  STEP 1b  Gap validation (candidates -> valid wagon boundaries)")
     print("-" * 70)
+    # Config holds ONLY camera-independent units (seconds / frame-width
+    # fractions / ratios). Absolute values, if any operator supplied the
+    # deprecated flags, are applied per camera below.
     gv_cfg = gval.GapValidationConfig(
         enabled=not args.no_gap_validation,
-        min_track_frames=int(args.gap_min_track_frames),
-        max_detection_gap_frames=int(args.gap_max_track_gap),
-        min_motion_px=float(args.gap_min_motion_px),
-        static_max_motion_px=float(args.gap_static_max_px),
-        min_motion_px_per_sec=float(args.gap_min_motion_px_sec),
-        max_motion_px_per_sec=float(args.gap_max_motion_px_sec),
+        min_track_seconds=float(args.gap_min_track_sec),
+        max_detection_gap_seconds=float(args.gap_max_track_gap_sec),
+        min_motion_frac=float(args.gap_min_motion_frac),
+        static_max_motion_frac=float(args.gap_static_max_frac),
+        min_motion_frac_per_sec=float(args.gap_min_motion_frac_sec),
+        max_motion_frac_per_sec=float(args.gap_max_motion_frac_sec),
+        min_separation_seconds=float(args.gap_min_separation_sec),
         min_monotonic_fraction=float(args.gap_min_monotonic),
         min_mean_confidence=float(args.gap_min_confidence),
         train_motion_tolerance=float(args.gap_motion_tolerance),
     )
+
+    # Deprecated absolute-unit flags -> per-camera overrides, converted with each
+    # camera's own width/fps at resolve() time. Nothing absolute is stored on the
+    # config, so a value given for one geometry cannot leak into another.
+    gv_overrides: Dict[str, float] = {}
+    for flag, attr, target in (
+        ("--gap-min-track-frames", "gap_min_track_frames", "min_track_frames"),
+        ("--gap-max-track-gap", "gap_max_track_gap", "max_detection_gap_frames"),
+        ("--gap-min-motion-px", "gap_min_motion_px", "min_motion_px"),
+        ("--gap-static-max-px", "gap_static_max_px", "static_max_motion_px"),
+        ("--gap-min-motion-px-sec", "gap_min_motion_px_sec", "min_motion_px_per_sec"),
+        ("--gap-max-motion-px-sec", "gap_max_motion_px_sec", "max_motion_px_per_sec"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            gv_overrides[target] = float(value)
+            print(f"NOTE: {flag} is deprecated -- thresholds are now expressed in "
+                  f"seconds and frame-width fractions so they generalize across "
+                  f"trains and camera geometry. Your value is applied verbatim as "
+                  f"a per-camera override for this run.", file=sys.stderr)
     gap_validation: Dict[str, gval.GapValidationResult] = {}
     for cam in ALL_CAMERAS:
         t = tracks[cam]
@@ -565,7 +619,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         # own resolution and frame rate -- nothing is assumed about either.
         res = gval.validate_gap_events(t.gaps, cam, gv_cfg,
                                        raw_detection_count=raw_n, verbose=verbose,
-                                       frame_width=t.width, fps=t.fps)
+                                       frame_width=t.width, fps=t.fps,
+                                       absolute_overrides=gv_overrides or None)
         gap_validation[cam] = res
         # Replace the camera's gap list with the validated subset and restore
         # track_id as a contiguous temporal rank, as the tracker produces.

@@ -302,16 +302,30 @@ class GapValidationConfig:
     violation is resolved as a suspected duplicate/fragmentation WITH diagnostics
     rather than silently deleted."""
 
-    def resolve(self, frame_width: int, fps: float) -> ResolvedThresholds:
+    def resolve(self, frame_width: int, fps: float,
+                absolute_overrides: Optional[Dict[str, float]] = None,
+                ) -> ResolvedThresholds:
         """Resolve camera-independent thresholds into this camera's units.
 
         Falls back to the development geometry only when a camera reports no
         usable width or fps, so a malformed stream cannot silently disable
         validation.
+
+        Parameters
+        ----------
+        absolute_overrides :
+            Optional ``{resolved_field_name: absolute_value}`` applied AFTER
+            resolution. This is the compatibility channel for deprecated
+            absolute-unit CLI flags (``--gap-min-motion-px``,
+            ``--gap-min-track-frames``, ...): the operator's pixel/frame value is
+            honoured verbatim for this camera, while the config itself keeps
+            storing only normalized units. Nothing absolute is ever persisted on
+            the config, so a single absolute override cannot silently become the
+            default for a differently-shaped camera.
         """
         w = int(frame_width) if frame_width and frame_width > 0 else 848
         f = float(fps) if fps and fps > 0 else 15.0
-        return ResolvedThresholds(
+        resolved = ResolvedThresholds(
             frame_width=w, fps=f,
             min_track_frames=max(2, int(round(self.min_track_seconds * f))),
             max_detection_gap_frames=max(
@@ -323,6 +337,16 @@ class GapValidationConfig:
             duplicate_max_center_px=self.duplicate_max_center_frac * w,
             min_separation_frames=max(1, int(round(self.min_separation_seconds * f))),
         )
+        for name, value in (absolute_overrides or {}).items():
+            if value is None:
+                continue
+            if not hasattr(resolved, name):
+                raise ValueError(
+                    f"unknown gap-validation threshold override {name!r}; "
+                    f"expected one of {sorted(ResolvedThresholds.__dataclass_fields__)}")
+            current = getattr(resolved, name)
+            setattr(resolved, name, type(current)(value))
+        return resolved
 
     def describe(self) -> Dict[str, Any]:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -512,6 +536,7 @@ def validate_gap_events(
     verbose: bool = True,
     frame_width: int = 0,
     fps: float = 0.0,
+    absolute_overrides: Optional[Dict[str, float]] = None,
 ) -> GapValidationResult:
     """Filter tracked gap candidates down to physically plausible wagon boundaries.
 
@@ -524,7 +549,7 @@ def validate_gap_events(
     # so nothing is assumed about resolution or frame rate.
     if not fps:
         fps = next((g.fps for g in gaps if g.fps), 0.0)
-    res_thr = cfg.resolve(frame_width, fps)
+    res_thr = cfg.resolve(frame_width, fps, absolute_overrides)
 
     result = GapValidationResult(
         camera_id=camera_id,
