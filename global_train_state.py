@@ -372,6 +372,14 @@ class GlobalTrainState:
     evidence for each decision."""
 
     gap_validation_config: Dict[str, Any] = field(default_factory=dict)
+
+    fragment_stitching: Dict[str, Any] = field(default_factory=dict)
+    """Per camera: which tracker fragments were reassembled into one physical gap
+    before validation ran, plus the seams that were considered and refused.
+
+    Recorded so a lost gap can be traced without re-running the tracker: a gap
+    that should have been reassembled but was not will appear in
+    `rejected_seams` with the criterion that refused it."""
     """The exact thresholds used, so a run is reproducible and auditable."""
 
     classification_model_by_camera: Dict[str, str] = field(default_factory=dict)
@@ -446,6 +454,7 @@ class GlobalTrainState:
             "temporal_classification_config": dict(self.temporal_classification_config),
             "gap_validation_statistics": dict(self.gap_validation_statistics),
             "gap_validation_config": dict(self.gap_validation_config),
+            "fragment_stitching": dict(self.fragment_stitching),
             "wagon_active_recovery": dict(self.wagon_active_recovery),
             "gap_rejection_details": dict(self.gap_rejection_details),
         }

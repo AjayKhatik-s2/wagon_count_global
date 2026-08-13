@@ -97,8 +97,13 @@ count.
 |---|---|---|
 | 0 | Parse CLI, resolve input/model paths | `_build_arg_parser`, `_resolve_input`, `_resolve_model` |
 | 1 | Per-camera gap tracking (×4) | `_process_side_camera`, `_process_top_camera` → `GapTracker.process_video` |
+| 1a | **Fragment reassembly** — rebuild one physical gap from the pieces the tracker split it into | `fstitch.reassemble_fragments` |
+| 1b | **Gap validation** — candidates → valid boundaries | `gval.validate_gap_events` |
 | 2 | Master classification | `_classify_master_pre_fusion` → `MasterClassifier` |
-| 3 | Cross-camera fusion + global build | `ga.assemble_global_train_state` |
+| 2a | Temporal classification (segment hysteresis) | `tcls.apply_temporal_classification` |
+| 2b | Support-camera classification | `ts.load_segment_classifier` |
+| 2c | WAGON_ACTIVE recovery (second validation pass) | `gval.recover_wagon_active_candidates` |
+| 3 | Cross-camera fusion + global build | `gf.assemble_global_train_state_master_fixed` (or `ga.assemble_global_train_state` under `--fusion legacy`) |
 | 4 | Write JSON | inline |
 | 5 | Overlay videos — **opt-in**, `--render-videos` | `vs.render_processed_video` |
 | 6 | Evidence report — **reporting only** | `er.build_combined_report` |
@@ -106,6 +111,19 @@ count.
 
 **The count is fully determined at the end of stage 3.** Stages 4–7 only
 serialize, draw and report it.
+
+Stages 1a and 1b are where a *detected and tracked* gap becomes a *counted*
+boundary, and they are ordered deliberately:
+
+- **1a decides which observations belong to the same physical object.** It never
+  accepts a gap and relaxes no threshold. Merging requires evidence; refusing to
+  merge leaves the fragments exactly as the tracker emitted them.
+- **1b decides whether that object is a wagon boundary.** Because 1a ran first,
+  every gate in 1b sees the whole gap rather than a piece of one.
+
+Getting this order wrong is what caused a measured under-count: judged
+piece-by-piece, each fragment of one real gap failed the minimum-duration gate,
+and three wagon boundaries were lost.
 
 ---
 

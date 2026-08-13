@@ -83,6 +83,7 @@ from tracker_engine import GapTracker, MasterClassifier, segments_from_gaps
 import global_alignment as ga
 import global_fusion as gf
 import gap_validation as gval
+import fragment_stitching as fstitch
 import train_structure as ts
 import temporal_classification as tcls
 import video_segmenter as vs
@@ -248,6 +249,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "strips, so this MUST be much smaller than the side ratio.")
     p.add_argument("--classification-samples", type=int, default=5,
                    help="Frames per segment for side_classification.pt vote (default: 5)")
+
+    # ---- fragment reassembly: rebuild physical gaps before validating them ---
+    _fs = fstitch.DEFAULT_FRAGMENT_STITCH
+    p.add_argument("--no-fragment-stitching", action="store_true",
+                   help="Disable fragment reassembly and validate each tracker "
+                        "fragment separately (previous behaviour). One physical "
+                        "gap split across several short tracks will then be "
+                        "rejected piece by piece.")
+    p.add_argument("--stitch-max-seam-sec", type=float,
+                   default=_fs.max_seam_seconds,
+                   help="Largest temporal hole between two fragments of the same "
+                        "physical gap, in SECONDS "
+                        f"(default {_fs.max_seam_seconds})")
+    p.add_argument("--stitch-seam-tolerance", type=float,
+                   default=_fs.seam_speed_tolerance,
+                   help="How far a seam jump may exceed what the local advance "
+                        "rate predicts, as a dimensionless ratio "
+                        f"(default {_fs.seam_speed_tolerance})")
+    p.add_argument("--stitch-max-seam-frac", type=float,
+                   default=_fs.max_seam_frac,
+                   help="Hard cap on seam displacement as a FRACTION of frame "
+                        f"width (default {_fs.max_seam_frac})")
 
     # ---- gap validation: raw YOLO gaps are CANDIDATES, not boundaries --------
     _gv = gval.DEFAULT_GAP_VALIDATION
@@ -588,6 +611,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     print()
 
     # ------------------------------------------------------------------
+    # STEP 1a -- FRAGMENT REASSEMBLY  (before validation, not inside it)
+    #
+    # One physical gap can leave the tracker as several short tracks: when a
+    # detection is missed the object reappears beyond the association gate, so
+    # the track closes and a new id opens. Validation would then judge each piece
+    # separately, reject each as too short, and lose the gap they jointly prove.
+    #
+    # Reassembly restores the physical object first, so every existing gate then
+    # applies to the whole gap. Nothing is accepted here and no threshold is
+    # relaxed -- this layer only decides which observations belong together.
+    # ------------------------------------------------------------------
+    print("-" * 70)
+    print("  STEP 1a  Fragment reassembly (tracker fragments -> physical gaps)")
+    print("-" * 70)
+    stitch_cfg = fstitch.FragmentStitchConfig(
+        enabled=not args.no_fragment_stitching,
+        max_seam_seconds=float(args.stitch_max_seam_sec),
+        seam_speed_tolerance=float(args.stitch_seam_tolerance),
+        max_seam_frac=float(args.stitch_max_seam_frac),
+    )
+    stitching: Dict[str, fstitch.StitchResult] = {}
+    for cam in ALL_CAMERAS:
+        t = tracks[cam]
+        # Geometry per camera: seam limits resolve from THIS camera's own width
+        # and frame rate, so nothing measured on one geometry leaks into another.
+        sres = fstitch.reassemble_fragments(
+            t.gaps, cam, stitch_cfg, frame_width=t.width, fps=t.fps,
+            verbose=verbose)
+        stitching[cam] = sres
+        t.gaps = sres.events
+    print()
+
+    # ------------------------------------------------------------------
     # STEP 1b -- GAP VALIDATION
     #
     # A raw YOLO gap detection is a CANDIDATE, not a wagon boundary. Each
@@ -906,6 +962,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if cam in gap_validation and gap_validation[cam].rejected
     }
     state.gap_validation_config = gv_cfg.describe()
+    state.fragment_stitching = {
+        cam: stitching[cam].to_dict()
+        for cam in ALL_CAMERAS if cam in stitching
+    }
     if recovery is not None:
         state.wagon_active_recovery = recovery.to_dict()
     state.classification_model_by_camera = classification_models

@@ -90,9 +90,12 @@ def accepted_times_by_camera(state: Dict[str, Any]) -> Dict[str, List[float]]:
     come from their own validation statistics where available.
     """
     out: Dict[str, List[float]] = {}
+    master = state.get("master_camera") or "RIGHT_UP"
     for g in state.get("global_gaps") or []:
-        cam = g.get("camera_id") or g.get("master_camera") or "RIGHT_UP"
-        t = g.get("time_start", g.get("start_time"))
+        cam = g.get("master_camera") or g.get("camera_id") or master
+        # 'master_time' is the fixed-master field name; the others are older
+        # spellings kept so an earlier run's JSON still resolves neighbours.
+        t = g.get("master_time", g.get("time_start", g.get("start_time")))
         if t is None:
             continue
         out.setdefault(cam, []).append(float(t))
@@ -236,6 +239,45 @@ def render_table(rows: Sequence[Dict[str, Any]], out=sys.stdout) -> None:
             out.write(" ".join(_cell(r[k], w) for k, _, w in COLUMNS) + "\n")
 
 
+def render_stitching(state: Dict[str, Any], out=sys.stdout) -> None:
+    """What fragment reassembly did, per camera.
+
+    Reported alongside the rejections because the two are complementary: a gap
+    lost to fragmentation shows up here as a seam that was NOT joined, not as a
+    rejection with an interesting reason.
+    """
+    blocks = state.get("fragment_stitching") or {}
+    if not blocks:
+        return
+    out.write("\n" + "=" * 78 + "\nFRAGMENT REASSEMBLY\n" + "=" * 78 + "\n")
+    for cam, b in sorted(blocks.items()):
+        if not isinstance(b, dict):
+            continue
+        out.write(f"\n{cam}: {b.get('input_candidates')} candidate(s) -> "
+                  f"{b.get('output_candidates')}   "
+                  f"reassembled={b.get('reassembled_gaps')}  "
+                  f"fragments_absorbed={b.get('fragments_absorbed')}\n")
+        adv = b.get("reference_advance_px_per_frame")
+        if adv:
+            out.write(f"  reference advance: {adv} px/frame   "
+                      f"dominant direction: {b.get('dominant_direction')}\n")
+        for c in b.get("chains") or []:
+            out.write(f"    tracks {c.get('member_track_ids')} -> frames "
+                      f"{c.get('start_frame')}-{c.get('end_frame')} "
+                      f"({c.get('hit_count')} hits)\n")
+        refused = b.get("rejected_seams") or []
+        if refused:
+            out.write(f"  {len(refused)} seam(s) considered and refused; "
+                      f"reasons:\n")
+            counts: Dict[str, int] = {}
+            for s in refused:
+                why = str(s.get("refused_because", "?"))
+                key = why.split(" -- ")[0][:70]
+                counts[key] = counts.get(key, 0) + 1
+            for why, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+                out.write(f"      {n:>4}  {why}\n")
+
+
 def render_summary(state: Dict[str, Any], rows: Sequence[Dict[str, Any]],
                    out=sys.stdout) -> None:
     start, end = wagon_window_frames(state)
@@ -325,6 +367,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     render_table(rows)
     if not a.no_summary:
+        render_stitching(state)
         render_summary(state, rows)
     if a.csv:
         write_csv(rows, a.csv)

@@ -154,6 +154,58 @@ Two rules govern the number:
 `total_wagons == master_wagon_count`, always. Support cameras contribute
 evidence, synchronization and diagnostics; they can never change the number.
 
+### Fragment reassembly
+
+```
+GapTracker completed fragments
+    -> fragment reassembly          (fragment_stitching.py)
+    -> reconstructed physical gaps
+    -> gap validation, unchanged
+```
+
+One physical gap is one object, but the tracker can emit it as several short
+tracks: when a detection is missed the gap reappears beyond the association gate,
+so the track closes and a new id opens. Validation then judges each piece
+separately, each is shorter than the minimum track duration, and the gap they
+jointly prove is never counted.
+
+This was measured on a real train, and confirmed against the video frames: one
+gap crossing the frame arrived as three consecutive 3-frame tracks. Three wagon
+boundaries were lost that way, leaving a single **184-frame "wagon"** where the
+median is 54 frames.
+
+Reassembly restores the object *before* any duration judgement, so every existing
+gate then applies to the whole gap. Two fragments are joined only when all hold:
+
+| Criterion | Why |
+|---|---|
+| strictly sequential, hole ≤ `--stitch-max-seam-sec` | overlapping tracks are duplicates or two simultaneous gaps, not one object |
+| both move in the camera's **dominant direction** | derived per camera from its own candidates |
+| the later fragment is **ahead** of the earlier one | a fragment behind its predecessor is a different object |
+| seam jump ≤ `--stitch-seam-tolerance` × what the **local advance rate** predicts | local, so acceleration, deceleration and stops are followed rather than assumed away |
+| seam jump ≤ `--stitch-max-seam-frac` of frame width | a long hole must not authorise a leap across the frame |
+| each fragment has ≥ 2 detections | a one-frame detection is never eligible, so raw detections cannot bypass tracking |
+
+Two properties make this safe rather than permissive:
+
+- **Merging is what needs evidence; refusing is free.** Failing any criterion
+  leaves the fragments exactly as the tracker emitted them, so the worst case is
+  today's behaviour.
+- **The reference comes from tracks long enough to trust.** A fragment cannot
+  measure train speed — measured, 3-hit tracks advance 29.7–41.7 px/frame while
+  tracks that pass validation on their own advance at a median of 47.7. Predicting
+  a seam from neighbouring fragments under-predicts ~2× and refuses exactly the
+  seams it should accept. So the advance rate is measured only from tracks of at
+  least `min_track_seconds`, and with fewer than three of those nothing is
+  stitched at all.
+
+Reassembly resolves both observed fragment cases with one rule and no
+special-casing: fragments whose neighbours are also fragments become **one new
+gap**, while a fragment whose neighbour already validates is **absorbed** into it
+— so the leading edge of an already-counted gap cannot double-count. It can only
+ever *reduce* the candidate count; it never accepts a gap, and a reassembled
+track still faces every gate below. Disable with `--no-fragment-stitching`.
+
 ### Gap validation
 
 Detection and tracking are unchanged: the existing YOLO models, confidence
