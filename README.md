@@ -16,9 +16,14 @@ wagon_count/
 ├── run_global_count.py          # entry point
 ├── global_train_state.py        # data classes
 ├── tracker_engine.py            # per-camera gap tracking + master classifier
-├── global_alignment.py          # cross-camera fusion
+├── gap_validation.py            # raw candidates -> validated gap boundaries
+├── global_fusion.py             # fixed-master fusion (RIGHT_UP is authoritative)
+├── global_alignment.py          # wagon construction from the gap sequence
+├── train_structure.py           # wagon window: first WAGON .. last WAGON
+├── temporal_classification.py   # segment-level classification hysteresis
 ├── video_segmenter.py           # overlay rendering + frame-range mapping
 ├── evidence_report.py           # 20/40/60/80% evidence + combined_report.pdf
+├── rejection_report.py          # diagnostic: table of every rejected candidate
 ├── validate_ec2.py              # pre-flight env/asset check (runs no pipeline)
 ├── setup_ec2.sh                 # Ubuntu/EC2 environment bootstrap
 ├── requirements.txt
@@ -155,26 +160,52 @@ Detection and tracking are unchanged: the existing YOLO models, confidence
 thresholds, Kalman parameters and association gates are all untouched. What is
 new is a deterministic validation layer between the tracker and fusion, which
 reads the motion the tracker already recorded on every `GapEvent`
-(`center_x_trajectory`, `hit_frames`, `bbox_history`) and applies eight
-independent tests:
+(`center_x_trajectory`, `hit_frames`, `bbox_history`).
 
-| Test | Rejection reason |
-|---|---|
-| track extent, hit count | `REJECTED_TOO_SHORT` |
-| blind runs, coverage | `REJECTED_DETECTION_GAP` |
-| mean track confidence | `REJECTED_LOW_CONFIDENCE` |
-| pinned centre | `REJECTED_STATIC` |
-| insufficient displacement | `REJECTED_LOW_MOTION` |
-| apparent speed out of band | `REJECTED_IMPLAUSIBLE_SPEED` |
-| direction flips | `REJECTED_INCONSISTENT_TRAJECTORY` |
-| against the camera's flow | `REJECTED_WRONG_DIRECTION` |
-| far from the camera's median speed | `REJECTED_TRAIN_MOTION_MISMATCH` |
-| same physical gap tracked twice | `REJECTED_DUPLICATE` |
+A raw detection is a **candidate**, never a boundary — high detection confidence
+is not evidence of a physical gap (the three false positives below all score
+0.93). Each candidate must survive every test below, and each rejection is either
+**HARD** (physically impossible for a real gap: it is an artefact in any train
+state) or **SOFT** (implausible *given its neighbours*, which is a judgement that
+can be wrong):
+
+| Test | Rejection reason | Class |
+|---|---|---|
+| pinned centre | `REJECTED_STATIC` | HARD |
+| against the camera's flow | `REJECTED_WRONG_DIRECTION` | HARD |
+| no trajectory at all | `REJECTED_NO_TRAJECTORY` | HARD |
+| track extent, hit count | `REJECTED_TOO_SHORT` | HARD |
+| blind runs, coverage | `REJECTED_DETECTION_GAP` | HARD |
+| same physical gap tracked twice | `REJECTED_DUPLICATE` | HARD |
+| too close in time to an accepted gap | `REJECTED_MIN_SEPARATION` | HARD |
+| far from the local median speed | `REJECTED_TRAIN_MOTION_MISMATCH` | SOFT |
+| apparent speed out of band | `REJECTED_IMPLAUSIBLE_SPEED` | SOFT |
+| insufficient displacement | `REJECTED_LOW_MOTION` | SOFT |
+| mean track confidence | `REJECTED_LOW_CONFIDENCE` | SOFT |
+| direction flips | `REJECTED_INCONSISTENT_TRAJECTORY` | SOFT |
+
+**WAGON_ACTIVE recovery.** Validation must run *before* classification, because
+classification needs the segments that validated gaps define — so the first pass
+cannot know whether a candidate sits inside the train's wagon run. Once the wagon
+window is derived, a second pass re-examines the SOFT rejections that fell inside
+it. This is deliberately not "accept everything inside the train": a recovered
+candidate must still clear every HARD gate plus safety floors on displacement,
+confidence, direction and **path efficiency** (`|net displacement| ÷ path
+travelled`). Path efficiency is what separates *noisier than expected* (~0.71 on
+real tracks) from *oscillating noise* (~0.13) — monotonic fraction cannot, since
+a drifting oscillation scores 0.55 monotonic while travelling 8× its own net
+displacement. Disable with `--no-wagon-recovery`.
 
 Nothing is discarded silently: every rejection is written to
 `global_train_state.json` with its reason **and** its measured features, so the
 chain `raw detections → tracked candidates → valid gap events` is auditable per
-camera.
+camera. `rejection_report.py` renders that record as a table (see
+**Diagnosing an under-count** below).
+
+Thresholds are **camera-independent**: every one is declared in seconds, as a
+fraction of frame width, or as a dimensionless ratio, then resolved to pixels and
+frames per camera at runtime from that camera's own width and FPS. Nothing is
+tuned to one train's geometry, speed or wagon count.
 
 Thresholds were set from measurement, not guesswork. Running the existing tracker
 over the first 1500 frames of three cameras gave:
@@ -192,9 +223,46 @@ rejects them. Gap direction is also per-camera (RIGHT_UP moves −x, LEFT_UP_TOP
 moves +x), so the dominant direction is derived from each camera's own tracks
 rather than assumed.
 
-Every default therefore has a measured margin: `--gap-static-max-px 4.0` against
-a smallest real displacement of 110.7 px, and `--gap-min-motion-px 12.0` a ~9×
-margin. All are CLI-configurable and recorded in the output JSON.
+Every default therefore has a measured margin: the static ceiling
+(`--gap-static-max-frac`, 0.0047 of frame width ≈ 4 px at 848 px) sits against a
+smallest real displacement of 110.7 px, and the motion floor
+(`--gap-min-motion-frac`, 0.0142 ≈ 12 px) keeps a ~9× margin. All are
+CLI-configurable and recorded in the output JSON.
+
+### Diagnosing an under-count
+
+When a train counts low, the question is always *which real gap was discarded, and
+by which gate?* The run already records every rejected candidate with its
+measured evidence; `rejection_report.py` renders it:
+
+```bash
+python rejection_report.py results/global_train_state.json
+
+# just the recoverable class, inside the counted region -- the under-count shape
+python rejection_report.py results/global_train_state.json \
+    --soft-only --wagon-active-only
+
+# for sharing / spreadsheets
+python rejection_report.py results/global_train_state.json --csv rejections.csv
+```
+
+Each row gives the track id, frame range, duration, confidence, displacement,
+its speed against the local reference speed, direction, monotonicity, path
+efficiency, the rejection reason and HARD/SOFT class, the train state
+(`PRE_WAGON` / `WAGON_ACTIVE` / `POST_WAGON`), the nearest accepted gap on either
+side, and what recovery did with it.
+
+Read it like this:
+
+- A **SOFT** rejection inside `WAGON_ACTIVE` that was **not** recovered is the
+  signature of a lost wagon boundary. The summary block lists these explicitly.
+- A rejected candidate sitting midway between two accepted gaps roughly **2×** the
+  normal spacing apart is almost certainly a real boundary that was dropped.
+- **HARD** rejections are static / reversed / duplicate / blind-track artefacts.
+  Those are meant to die, in every train state.
+
+The script reads only the run's JSON — it re-runs no models and re-derives
+nothing, so it cannot disagree with the pipeline that produced the numbers.
 
 ### `combined_report.pdf` — the evidence report
 

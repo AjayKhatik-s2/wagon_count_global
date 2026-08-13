@@ -44,10 +44,15 @@ models/*.weights
 # then deletes itself.
 # -----------------------------------------------------------------------------
 results/
+results_*/
 outputs/
 processed_videos/
 frames/
 .evidence_tmp/
+
+# Local editor/agent settings. settings.local.json in particular is per-machine
+# and can carry local paths, so keep the whole directory out of the repo.
+.claude/
 *_processed.mp4
 combined_report.pdf
 global_train_state.json

@@ -366,6 +366,11 @@ class GlobalTrainState:
     """Per camera: every rejected candidate with its reason and measured motion
     features. Nothing is discarded silently."""
 
+    wagon_active_recovery: Dict[str, Any] = field(default_factory=dict)
+    """Second-pass recovery of soft-failed candidates inside the wagon window:
+    how many were considered, recovered, or blocked by a hard gate, with the
+    evidence for each decision."""
+
     gap_validation_config: Dict[str, Any] = field(default_factory=dict)
     """The exact thresholds used, so a run is reproducible and auditable."""
 
@@ -441,6 +446,7 @@ class GlobalTrainState:
             "temporal_classification_config": dict(self.temporal_classification_config),
             "gap_validation_statistics": dict(self.gap_validation_statistics),
             "gap_validation_config": dict(self.gap_validation_config),
+            "wagon_active_recovery": dict(self.wagon_active_recovery),
             "gap_rejection_details": dict(self.gap_rejection_details),
         }
 

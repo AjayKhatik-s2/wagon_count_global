@@ -344,6 +344,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         f"{_tc.min_confidence_to_challenge})")
 
     # ---- train structure ----------------------------------------------------
+    p.add_argument("--no-wagon-recovery", action="store_true",
+                   help="Disable the WAGON_ACTIVE second validation pass. By "
+                        "default a master candidate inside the confirmed wagon "
+                        "region that failed only a SOFT gate (speed, trajectory "
+                        "noise, weaker confidence) is re-examined and accepted if "
+                        "it clears every hard gate. Hard gates -- untracked, too "
+                        "short, blind track, isolated static, wrong direction, "
+                        "duplicate, separation -- always reject.")
     p.add_argument("--no-wagon-only", action="store_true",
                    help="Count every segment instead of only the WAGON region "
                         "between the first and last WAGON. Off by default: "
@@ -416,6 +424,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Don't keep raw per-frame detections in memory (saves RAM)")
     p.add_argument("--quiet", action="store_true", help="Reduce log verbosity")
     return p
+
+
+def _derive_wagon_window(master: LocalCameraTracks, classifications, verbose=False):
+    """Derive the wagon window from the CURRENT master gaps + classifications.
+
+    Runtime-derived only: the window comes from the classified segments that the
+    master's own validated gaps define. No frame numbers or timestamps are
+    assumed, so it holds for any train.
+    """
+    if not classifications:
+        return None
+    try:
+        segments = ga.build_global_wagons(
+            list(master.gaps),
+            master_total_frames=master.total_frames, master_fps=master.fps,
+            initial_classifications=list(classifications),
+            support_camera_ids=[])
+        return ts.get_master_wagon_window(segments, verbose=verbose)
+    except Exception:
+        return None
 
 
 def _resolved_camera_offsets(state: GlobalTrainState) -> Dict[str, float]:
@@ -752,6 +780,71 @@ def main(argv: Optional[List[str]] = None) -> int:
                 _pending_notes.append(state_note)
 
     # ------------------------------------------------------------------
+    # STEP 2c -- WAGON_ACTIVE RECOVERY  (second validation pass)
+    #
+    # Validation had to run in STEP 1b, before classification, because
+    # classification needs the segments that validated gaps define. So the first
+    # pass could not know the train state. Now that the wagon window exists,
+    # re-examine the master candidates that fell INSIDE it and failed only a SOFT
+    # gate (speed vs the local reference, absolute speed band, sub-floor
+    # displacement, weaker confidence, noisier trajectory).
+    #
+    # Every HARD gate still rejects: untracked, insufficient confirmation,
+    # mostly-blind track, isolated static artefact, wrong direction, duplicate,
+    # minimum-separation duplicate. Recovery also re-checks duplicate and
+    # separation against the accepted set, so it cannot crowd an existing gap.
+    #
+    # This is what makes a genuine wagon gap inside the wagon run count
+    # immediately: no further classification event is awaited.
+    # ------------------------------------------------------------------
+    recovery = None
+    if (not args.no_gap_validation and not args.no_wagon_recovery
+            and gap_validation.get(CAMERA_RIGHT_UP)):
+        print()
+        print("-" * 70)
+        print("  STEP 2c  WAGON_ACTIVE recovery (soft-failed gaps inside the "
+              "wagon region)")
+        print("-" * 70)
+        _win = _derive_wagon_window(master, initial_classifications, verbose=False)
+        if _win is not None and _win.wagon_start_frame is not None:
+            print(f"  wagon window (runtime-derived): frames "
+                  f"{_win.wagon_start_frame}-{_win.wagon_end_frame}")
+            recovery = gval.recover_wagon_active_candidates(
+                gap_validation[CAMERA_RIGHT_UP].rejected,
+                master.gaps,
+                _win.wagon_start_frame, _win.wagon_end_frame,
+                CAMERA_RIGHT_UP, gv_cfg,
+                frame_width=master.width, fps=master.fps,
+                absolute_overrides=gv_overrides or None, verbose=verbose)
+            if recovery.recovered:
+                master.gaps = gval.renumber_gap_events(
+                    list(master.gaps) + list(recovery.recovered))
+                # The master gap sequence changed, so the segments and therefore
+                # the classification must be rebuilt from it.
+                print(f"  recovered {len(recovery.recovered)} gap(s) -> "
+                      f"re-deriving master segments and classification")
+                try:
+                    initial_classifications = _classify_master_pre_fusion(
+                        master, side_cls_path,
+                        num_samples=args.classification_samples, verbose=False)
+                    if initial_classifications:
+                        initial_classifications, tres2 = \
+                            tcls.apply_temporal_classification(
+                                initial_classifications, master.fps,
+                                camera_id=CAMERA_RIGHT_UP, cfg=tc_cfg,
+                                verbose=False)
+                        temporal_results[CAMERA_RIGHT_UP] = tres2
+                except Exception as e:
+                    print(f"WARNING: re-classification after recovery failed: {e}",
+                          file=sys.stderr)
+                    _pending_notes.append(f"reclassification_after_recovery:{e}")
+            else:
+                print("  no gap recovered -- every wagon-window candidate either "
+                      "passed already or failed a hard gate")
+        else:
+            print("  no wagon window derived -- recovery skipped")
+
+    # ------------------------------------------------------------------
     # STEP 3 -- cross-camera fusion
     # ------------------------------------------------------------------
     print()
@@ -813,6 +906,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if cam in gap_validation and gap_validation[cam].rejected
     }
     state.gap_validation_config = gv_cfg.describe()
+    if recovery is not None:
+        state.wagon_active_recovery = recovery.to_dict()
     state.classification_model_by_camera = classification_models
     state.temporal_classification = {
         cam: tres.to_dict(include_samples=False)

@@ -83,6 +83,7 @@ REJECTED_DUPLICATE = "REJECTED_DUPLICATE"
 REJECTED_TRAIN_MOTION_MISMATCH = "REJECTED_TRAIN_MOTION_MISMATCH"
 REJECTED_WRONG_DIRECTION = "REJECTED_WRONG_DIRECTION"
 REJECTED_NO_TRAJECTORY = "REJECTED_NO_TRAJECTORY"
+REJECTED_MIN_SEPARATION = "REJECTED_MIN_SEPARATION"
 
 # Assigned later in the pipeline (wagon window), listed here so the vocabulary
 # lives in one place.
@@ -96,7 +97,40 @@ ALL_REJECTION_REASONS = (
     REJECTED_DUPLICATE, REJECTED_TRAIN_MOTION_MISMATCH,
     REJECTED_WRONG_DIRECTION, REJECTED_NO_TRAJECTORY,
     REJECTED_OUTSIDE_WAGON_WINDOW, REJECTED_NON_WAGON_REGION,
+    REJECTED_MIN_SEPARATION,
 )
+
+# =============================================================================
+# HARD vs SOFT rejection reasons
+#
+# Inside a CONFIRMED WAGON_ACTIVE region the train is physically in its wagon
+# run, so a correctly tracked, correctly directed, temporally valid candidate is
+# far more likely to be a real wagon boundary than the same candidate would be
+# before the train arrives or after it leaves. That context is used to relax the
+# SOFT gates only -- the HARD gates are exactly the protections that must never
+# depend on context.
+# =============================================================================
+
+HARD_REJECTION_REASONS = frozenset({
+    REJECTED_NO_TRAJECTORY,          # not a usable track at all
+    REJECTED_TOO_SHORT,              # insufficient tracker confirmation
+    REJECTED_DETECTION_GAP,          # corrupted / mostly-blind track
+    REJECTED_STATIC,                 # isolated pinned artefact
+    REJECTED_WRONG_DIRECTION,        # travels against the train
+    REJECTED_DUPLICATE,              # same physical gap already accepted
+    REJECTED_MIN_SEPARATION,         # resolved as a duplicate/fragment
+})
+"""Never relaxed, in any train state. These are the false-positive defences."""
+
+SOFT_REJECTION_REASONS = frozenset({
+    REJECTED_TRAIN_MOTION_MISMATCH,  # speed differs from the local reference
+    REJECTED_IMPLAUSIBLE_SPEED,      # speed outside the plausible band
+    REJECTED_LOW_MOTION,             # moved, but less than the floor
+    REJECTED_LOW_CONFIDENCE,         # weaker detector confidence
+    REJECTED_INCONSISTENT_TRAJECTORY,  # noisier trajectory than expected
+})
+"""Relaxable inside a confirmed WAGON_ACTIVE region, subject to the safety
+floors in `GapValidationConfig` -- a soft reason is not a free pass."""
 
 
 # =============================================================================
@@ -280,6 +314,47 @@ class GapValidationConfig:
     Requiring corroboration is what keeps this from becoming a hole: one static
     artefact can never excuse itself. Set to 0 to disable."""
 
+    # ---- WAGON_ACTIVE recovery policy -----------------------------------
+    wagon_active_recovery_enabled: bool = True
+    """Inside a CONFIRMED wagon region, re-examine candidates that failed only a
+    SOFT gate and accept them if they still clear every HARD requirement.
+
+    Rationale: validation runs before classification (it produces the segments
+    classification needs), so the first pass cannot know the train state. Once
+    the wagon window is derived, the candidates that fell inside it are
+    re-examined with that context. Two independent real trains showed genuine
+    wagon gaps lost to soft speed/trajectory gates inside the wagon run.
+
+    This is NOT 'accept everything in WAGON_ACTIVE': the HARD gates
+    (untracked, too short, blind track, isolated static, wrong direction,
+    duplicate, separation) still reject, and the floors below still apply."""
+
+    wagon_active_min_monotonic: float = 0.45
+    """Trajectory floor for recovery. Above the normal threshold a candidate is
+    accepted outright; between this floor and the threshold its trajectory is
+    merely noisier than expected and is recoverable; at or below this floor the
+    direction reverses about as often as it holds, which is noise rather than an
+    object crossing the frame, so it stays rejected. Dimensionless."""
+
+    wagon_active_min_path_efficiency: float = 0.40
+    """Path-efficiency floor for recovery: |net displacement| / path travelled.
+
+    Measured on synthetic shapes matching real behaviour -- a noisy-but-genuine
+    sweep scores ~0.71, while an oscillation that drifts scores ~0.13. 0.40 sits
+    between them. This is the gate that keeps 'noisy trajectory' recoverable
+    while 'impossible/noise trajectory' stays rejected."""
+
+    wagon_active_min_confidence: float = 0.30
+    """Confidence floor for recovery. A weaker detection inside the wagon run can
+    still be a real gap, but a near-chance one cannot. Model-scale, not
+    train-scale, so it transfers between trains."""
+
+    wagon_active_min_motion_frac: float = 0.0
+    """Optional extra displacement floor for recovery, as a FRACTION OF FRAME
+    WIDTH. 0.0 means 'inherit static_max_motion_frac', i.e. anything the static
+    gate did not already reject. Raise it to demand more movement before a
+    soft-failed candidate is recovered."""
+
     train_motion_check_enabled: bool = True
     min_tracks_for_train_reference: int = 5
     """A per-camera reference speed is only computed when at least this many
@@ -424,6 +499,15 @@ class GapMotionFeatures:
     min_confidence: Optional[float]
     bbox_height_median: Optional[float]
     bbox_width_median: Optional[float]
+    path_efficiency: float = 0.0
+    """|net displacement| / total path travelled, in [0, 1].
+
+    1.0 is a straight sweep; a value near 0 means the centre wandered back and
+    forth far more than it progressed. This separates 'noisier trajectory than
+    expected' (still ~0.7 on real data) from 'oscillating noise' (~0.1), which
+    monotonic fraction alone does not: an oscillation that drifts can score 0.55
+    monotonic while travelling 8x its own net displacement. Dimensionless, so it
+    transfers across geometries."""
     motion_reference_speed: Optional[float] = None
     """The reference speed this candidate was judged against (px/s)."""
     motion_reference_kind: str = ""
@@ -445,9 +529,21 @@ class GapRejection:
     reason: str
     detail: str
     features: GapMotionFeatures
+    source_event: Optional[GapEvent] = None
+    """The GapEvent that was rejected. Retained so a later, better-informed pass
+    (WAGON_ACTIVE recovery) can re-admit it without re-deriving anything."""
+
+    @property
+    def is_hard(self) -> bool:
+        return self.reason in HARD_REJECTION_REASONS
+
+    @property
+    def is_soft(self) -> bool:
+        return self.reason in SOFT_REJECTION_REASONS
 
     def to_dict(self) -> Dict[str, Any]:
         return {"reason": self.reason, "detail": self.detail,
+                "hard": self.is_hard, "soft": self.is_soft,
                 "features": self.features.to_dict()}
 
 
@@ -464,6 +560,10 @@ class GapValidationResult:
     config_used: Dict[str, Any] = field(default_factory=dict)
     resolved_thresholds: Dict[str, Any] = field(default_factory=dict)
     """The camera-independent config resolved into this camera's px/frames."""
+    separation_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    """Minimum-separation violations that were investigated and KEPT, with the
+    evidence. Recorded so a train whose gaps genuinely sit closer than the
+    observed norm is visible rather than silently trimmed."""
     train_stopped_detected: bool = False
     """True when several confirmed tracks stalled together, i.e. the TRAIN
     stopped rather than individual detections being static artefacts."""
@@ -520,6 +620,7 @@ class GapValidationResult:
                 if self.train_reference_speed is not None else None),
             "resolved_thresholds": dict(self.resolved_thresholds),
             "train_stopped_detected": self.train_stopped_detected,
+            "separation_diagnostics": list(self.separation_diagnostics),
             "train_motion_state": self.train_motion_state,
             "motion_paused_tracks": sum(1 for f in self.features if f.motion_paused),
         }
@@ -575,6 +676,8 @@ def compute_motion_features(gap: GapEvent) -> Optional[GapMotionFeatures]:
 
     displacement = traj[-1] - traj[0]
     abs_disp = abs(displacement)
+    path_len = sum(abs(b - a) for a, b in zip(traj, traj[1:]))
+    efficiency = (abs_disp / path_len) if path_len > 0 else 0.0
 
     heights = [b[3] - b[1] for b in (gap.bbox_history or []) if len(b) >= 4]
     widths = [b[2] - b[0] for b in (gap.bbox_history or []) if len(b) >= 4]
@@ -589,6 +692,7 @@ def compute_motion_features(gap: GapEvent) -> Optional[GapMotionFeatures]:
         center_start=traj[0], center_end=traj[-1],
         displacement_px=displacement, abs_displacement_px=abs_disp,
         velocity_px_per_sec=(abs_disp / duration) if duration > 0 else 0.0,
+        path_efficiency=efficiency,
         direction=dominant, monotonic_fraction=monotonic, n_steps=len(steps),
         step_velocity_median=(statistics.median(steps) if steps else None),
         mean_confidence=gap.confidence, min_confidence=None,
@@ -704,7 +808,7 @@ def validate_gap_events(
                     velocity_px_per_sec=0.0, direction=0, monotonic_fraction=0.0,
                     n_steps=0, step_velocity_median=None,
                     mean_confidence=g.confidence, min_confidence=None,
-                    bbox_height_median=None, bbox_width_median=None)))
+                    bbox_height_median=None, bbox_width_median=None), g))
             continue
 
         result.features.append(f)
@@ -771,7 +875,7 @@ def validate_gap_events(
                       f"< min_monotonic_fraction={cfg.min_monotonic_fraction}")
 
         if reason:
-            result.rejected.append(GapRejection(reason, detail, f))
+            result.rejected.append(GapRejection(reason, detail, f, g))
         else:
             survivors.append((g, f))
 
@@ -791,7 +895,7 @@ def validate_gap_events(
                         f"this camera's gaps travel in "
                         f"{'+x' if dominant > 0 else '-x'} "
                         f"({max(n_pos, n_neg)} of {len(survivors)} tracks); a gap "
-                        f"moving against the train is not a wagon boundary", f))
+                        f"moving against the train is not a wagon boundary", f, g))
                 else:
                     kept.append((g, f))
             survivors = kept
@@ -856,7 +960,7 @@ def validate_gap_events(
                                f"track stalls with it, so this is an isolated "
                                f"static artefact rather than a train stop")
                 result.rejected.append(GapRejection(
-                    REJECTED_TRAIN_MOTION_MISMATCH, detail, f))
+                    REJECTED_TRAIN_MOTION_MISMATCH, detail, f, g))
             survivors = kept
 
     # ---- pass 3: duplicate suppression -- one physical gap, one GapEvent ----
@@ -886,8 +990,62 @@ def validate_gap_events(
                     f"track {loser.track_id} overlaps track "
                     f"{(kg if loser is g else g).track_id} in time and position: "
                     f"same physical gap, so only one GapEvent is kept",
-                    loser_f))
+                    loser_f, loser))
         survivors = sorted(deduped, key=lambda t: (t[0].center_frame, t[0].track_id))
+
+    # ---- pass 4: minimum physical separation between VALIDATED events ------
+    #
+    # Applied to final events only, never to raw detections (which legitimately
+    # cluster because several belong to one track). A violation is investigated
+    # as a suspected duplicate/fragment rather than deleted on sight: the weaker
+    # of the pair goes, and the decision is recorded with both tracks' evidence.
+    if res_thr.min_separation_frames > 1:
+        survivors.sort(key=lambda t: (t[0].center_frame, t[0].track_id))
+        kept: List[Tuple[GapEvent, GapMotionFeatures]] = []
+        for g, f in survivors:
+            if not kept:
+                kept.append((g, f))
+                continue
+            pg, pf = kept[-1]
+            sep = int(round(g.center_frame)) - int(round(pg.center_frame))
+            if sep >= res_thr.min_separation_frames:
+                kept.append((g, f))
+                continue
+            # Close in TIME. That alone does not make them one gap: a wide view
+            # can show two couplings at once, and those are distinct physical
+            # boundaries. Only when they are ALSO close in image position is a
+            # duplicate/fragment the better explanation.
+            if abs(f.center_start - pf.center_start) > res_thr.duplicate_max_center_px:
+                result.separation_diagnostics.append({
+                    "track_id": g.track_id,
+                    "other_track_id": pg.track_id,
+                    "separation_frames": sep,
+                    "min_separation_frames": res_thr.min_separation_frames,
+                    "center_distance_px": round(
+                        abs(f.center_start - pf.center_start), 2),
+                    "verdict": "kept: close in time but far apart in the image, "
+                               "so these are two simultaneous physical gaps "
+                               "rather than one fragmented track",
+                })
+                kept.append((g, f))
+                continue
+            # Too close in time AND position to be two distinct boundaries. Keep
+            # whichever track is better evidenced and record the other.
+            loser, loser_f, winner = ((g, f, pg) if (pf.hits, pf.mean_confidence)
+                                      >= (f.hits, f.mean_confidence)
+                                      else (pg, pf, g))
+            if loser is pg:
+                kept[-1] = (g, f)
+            result.rejected.append(GapRejection(
+                REJECTED_MIN_SEPARATION,
+                f"only {sep} frame(s) from validated track {winner.track_id} "
+                f"(< min_separation_frames={res_thr.min_separation_frames}, "
+                f"= {cfg.min_separation_seconds}s at {res_thr.fps:g} fps). Two "
+                f"physical wagon boundaries cannot be this close, so this is a "
+                f"duplicate or a tracker fragment; the better-evidenced track "
+                f"({winner.track_id}: {max(pf.hits, f.hits)} hits) is kept",
+                loser_f, loser))
+        survivors = kept
 
     result.accepted = [g for g, _ in survivors]
 
@@ -904,6 +1062,191 @@ def validate_gap_events(
             print(f"      train reference speed: "
                   f"{result.train_reference_speed:.1f} px/s (median of survivors)")
 
+    return result
+
+
+@dataclass
+class RecoveryResult:
+    """Outcome of the WAGON_ACTIVE second pass."""
+    camera_id: str
+    recovered: List[GapEvent] = field(default_factory=list)
+    still_rejected: List[GapRejection] = field(default_factory=list)
+    considered: int = 0
+    outside_window: int = 0
+    hard_blocked: int = 0
+    details: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "camera_id": self.camera_id,
+            "candidates_considered": self.considered,
+            "outside_wagon_window": self.outside_window,
+            "blocked_by_hard_gate": self.hard_blocked,
+            "recovered": len(self.recovered),
+            "still_rejected": len(self.still_rejected),
+            "details": list(self.details),
+        }
+
+
+def recover_wagon_active_candidates(
+    rejected: Sequence[GapRejection],
+    accepted: Sequence[GapEvent],
+    wagon_start_frame: Optional[int],
+    wagon_end_frame: Optional[int],
+    camera_id: str,
+    cfg: GapValidationConfig = DEFAULT_GAP_VALIDATION,
+    frame_width: int = 0,
+    fps: float = 0.0,
+    absolute_overrides: Optional[Dict[str, float]] = None,
+    verbose: bool = True,
+) -> RecoveryResult:
+    """Second pass: recover SOFT-failed candidates inside the wagon window.
+
+    WHY A SECOND PASS. Validation must run before classification, because
+    classification needs the segments that validated gaps define. The first pass
+    therefore cannot know the train state. Once the wagon window has been derived
+    the candidates that fell inside it are re-examined WITH that context.
+
+    WHAT IS RELAXED. Only the SOFT gates -- speed vs the local reference,
+    absolute speed band, sub-floor displacement, weaker confidence, noisier
+    trajectory. Every HARD gate still rejects:
+
+        untracked / no trajectory      insufficient tracker confirmation
+        mostly-blind track             isolated static artefact
+        wrong direction                duplicate of an accepted gap
+        minimum-separation duplicate
+
+    WHAT STILL APPLIES. Recovery is not a free pass. A candidate must clear the
+    trajectory floor, the confidence floor, the displacement floor, must not
+    duplicate an already-accepted gap in time and position, and must respect the
+    minimum separation from its accepted neighbours.
+
+    Deterministic and side-effect free: `accepted` is not mutated.
+    """
+    result = RecoveryResult(camera_id=camera_id)
+    if not cfg.enabled or not cfg.wagon_active_recovery_enabled:
+        result.still_rejected = list(rejected)
+        return result
+    if wagon_start_frame is None or wagon_end_frame is None:
+        result.still_rejected = list(rejected)
+        if verbose:
+            print(f"  [RECOVER/{camera_id}] no wagon window -> nothing considered")
+        return result
+
+    if not fps:
+        fps = next((g.fps for g in accepted if g.fps), 0.0)
+    thr = cfg.resolve(frame_width, fps, absolute_overrides)
+    motion_floor = (cfg.wagon_active_min_motion_frac * thr.frame_width
+                    if cfg.wagon_active_min_motion_frac > 0
+                    else thr.static_max_motion_px)
+
+    # Work against a growing accepted set so recovered gaps also protect each
+    # other from duplicates and separation violations.
+    live: List[GapEvent] = sorted(accepted, key=lambda g: g.center_frame)
+
+    for rej in sorted(rejected, key=lambda r: r.features.frame_start):
+        f = rej.features
+        centre = int(round((f.frame_start + f.frame_end) / 2))
+
+        if not (wagon_start_frame <= centre <= wagon_end_frame):
+            result.outside_window += 1
+            result.still_rejected.append(rej)
+            continue
+
+        result.considered += 1
+
+        if rej.reason in HARD_REJECTION_REASONS:
+            result.hard_blocked += 1
+            result.still_rejected.append(rej)
+            result.details.append({
+                "track_id": f.track_id, "frame": centre, "outcome": "blocked",
+                "reason": rej.reason,
+                "note": "hard gate -- never relaxed by train state"})
+            continue
+
+        if rej.reason not in SOFT_REJECTION_REASONS:
+            result.still_rejected.append(rej)
+            continue
+
+        # ---- safety floors: a soft reason is not a free pass ----
+        blocked_by = None
+        if f.abs_displacement_px <= motion_floor:
+            blocked_by = (f"displacement {f.abs_displacement_px:.1f}px <= floor "
+                          f"{motion_floor:.1f}px")
+        elif (f.n_steps >= cfg.min_steps_for_trajectory
+                and f.path_efficiency < cfg.wagon_active_min_path_efficiency):
+            blocked_by = (f"path efficiency {f.path_efficiency:.2f} < floor "
+                          f"{cfg.wagon_active_min_path_efficiency} -- the centre "
+                          f"wandered far more than it progressed, which is noise "
+                          f"rather than an object crossing the frame")
+        elif (f.n_steps >= cfg.min_steps_for_trajectory
+                and f.monotonic_fraction < cfg.wagon_active_min_monotonic):
+            blocked_by = (f"monotonic {f.monotonic_fraction:.2f} < floor "
+                          f"{cfg.wagon_active_min_monotonic}")
+        elif f.mean_confidence < cfg.wagon_active_min_confidence:
+            blocked_by = (f"confidence {f.mean_confidence:.2f} < floor "
+                          f"{cfg.wagon_active_min_confidence}")
+        elif f.direction == 0:
+            blocked_by = "no dominant direction"
+
+        if blocked_by:
+            result.still_rejected.append(rej)
+            result.details.append({
+                "track_id": f.track_id, "frame": centre, "outcome": "blocked",
+                "reason": rej.reason, "note": f"soft, but {blocked_by}"})
+            continue
+
+        # ---- must not duplicate, or crowd, an already-accepted gap ----
+        clash = None
+        for ag in live:
+            a_centre = int(round(ag.center_frame))
+            overlap = not (ag.end_frame < f.frame_start
+                           or ag.start_frame > f.frame_end)
+            a_x = (ag.center_x_trajectory[0] if ag.center_x_trajectory else None)
+            close_x = (a_x is not None
+                       and abs(a_x - f.center_start) <= thr.duplicate_max_center_px)
+            if overlap and close_x:
+                clash = (ag, "overlaps an accepted gap in time and position")
+                break
+            if (abs(a_centre - centre) < thr.min_separation_frames and close_x):
+                clash = (ag, f"only {abs(a_centre - centre)} frame(s) from "
+                             f"accepted track {ag.track_id} at a similar position")
+                break
+        if clash:
+            result.still_rejected.append(rej)
+            result.details.append({
+                "track_id": f.track_id, "frame": centre, "outcome": "blocked",
+                "reason": rej.reason,
+                "note": f"soft, but {clash[1]} -- duplicate protection holds"})
+            continue
+
+        # ---- recovered ----
+        result.details.append({
+            "track_id": f.track_id, "frame": centre, "outcome": "recovered",
+            "original_reason": rej.reason,
+            "displacement_px": round(f.abs_displacement_px, 1),
+            "speed_px_per_sec": round(f.velocity_px_per_sec, 1),
+            "reference_speed": (round(f.motion_reference_speed, 1)
+                                if f.motion_reference_speed else None),
+            "monotonic": round(f.monotonic_fraction, 2),
+            "confidence": round(f.mean_confidence, 3),
+            "note": "inside the confirmed wagon region and clears every hard "
+                    "gate, so the soft failure alone does not reject it",
+        })
+        result.recovered.append(rej.source_event)
+        live.append(rej.source_event)
+        live.sort(key=lambda g: g.center_frame)
+
+    if verbose:
+        print(f"  [RECOVER/{camera_id}] wagon-window candidates="
+              f"{result.considered}  recovered={len(result.recovered)}  "
+              f"hard-blocked={result.hard_blocked}  "
+              f"outside-window={result.outside_window}")
+        for d in result.details:
+            if d["outcome"] == "recovered":
+                print(f"      + trk {d['track_id']} @f{d['frame']}: was "
+                      f"{d['original_reason']}, speed={d['speed_px_per_sec']} "
+                      f"px/s vs ref {d['reference_speed']}")
     return result
 
 
