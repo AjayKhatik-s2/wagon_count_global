@@ -46,6 +46,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import shutil
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -900,6 +901,160 @@ class _ReportBuilder:
     # ------------------------------------------------------------------
     # Event evidence pages: 4 cameras x 4 percentages
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Inspection sections (door state, top damage)
+    #
+    # Rendered from state.inspection ONLY. No model is re-run and no detection
+    # logic lives here, so the PDF cannot disagree with the JSON or with the
+    # overlay videos -- all three read the same record.
+    # ------------------------------------------------------------------
+    def add_inspection_sections(self, state: GlobalTrainState) -> None:
+        insp = getattr(state, "inspection", None) or {}
+        p = self.new_page()
+        y = self._header(p, "GLOBAL TRAIN INSPECTION",
+                         "door state  /  top damage")
+
+        if not insp:
+            self._kv_block(
+                p, self.margin, y, self.w - 2 * self.margin,
+                "INSPECTION NOT RUN",
+                [("status", "no inspection record in this run"),
+                 ("wagon count", "unaffected -- counting is independent"),
+                 ("how to enable", "provide door_state.pt / top_damage.pt and "
+                                   "omit --no-inspection")])
+            return
+
+        summary = insp.get("summary") or {}
+        avail = insp.get("model_availability") or {}
+        col_w = (self.w - 2 * self.margin) // 2
+        right_x = self.margin + col_w + int(0.02 * self.w)
+
+        y_left = self._kv_block(
+            p, self.margin, y, col_w - int(0.03 * self.w),
+            "FINDINGS",
+            [("confirmed door findings",
+              str(summary.get("confirmed_door_events", 0))),
+             ("confirmed damage findings",
+              str(summary.get("confirmed_damage_events", 0))),
+             ("wagons with a door finding",
+              str(summary.get("wagons_with_door_finding", 0))),
+             ("wagons with a damage finding",
+              str(summary.get("wagons_with_damage_finding", 0))),
+             ("rejected candidates", str(summary.get("rejected_events", 0))),
+             ("unresolved associations",
+              str(summary.get("unresolved_associations", 0))),
+             ("evidence frames", str(summary.get("evidence_frames", 0))),
+             ("association status",
+              str(summary.get("association_status", "-")))],
+            emphasise={"confirmed door findings", "confirmed damage findings"})
+
+        rows = []
+        for role in ("door", "top_damage"):
+            a = avail.get(role) or {}
+            names = a.get("class_names") or {}
+            rows.append([role, str(a.get("status", "-")), str(a.get("task", "-")),
+                         ", ".join(str(names[k]) for k in
+                                   sorted(names, key=lambda z: int(z))) or "-"])
+        y_right = self._table_block(
+            p, right_x, y, self.w - self.margin - right_x,
+            "MODELS AND THEIR OWN CLASS NAMES",
+            ["role", "status", "type", "classes"], rows)
+
+        y = max(y_left, y_right) + int(self.s_body * 0.8)
+        self._kv_block(
+            p, self.margin, y, self.w - 2 * self.margin,
+            "HOW TO READ A PER-CAMERA STATUS",
+            [("CONFIRMED", "a tracked, confirmed finding on this wagon"),
+             ("NO_DETECTION", "the camera saw this wagon and found nothing"),
+             ("NOT_VISIBLE", "the wagon lies outside this camera's footage -- "
+                             "NOT evidence of a clean wagon"),
+             ("UNRESOLVED", "the camera's clock offset was never resolved, so "
+                            "nothing here can be attributed to a wagon"),
+             ("NOT_APPLICABLE", "this model does not run on this camera")])
+
+        self._add_inspection_table(insp)
+        self._add_inspection_diagnostics(insp)
+
+    def _add_inspection_table(self, insp: Dict[str, Any]) -> None:
+        """Wagon-by-wagon table. EVERY wagon appears, findings or not."""
+        wagons = insp.get("wagons") or {}
+        if not wagons:
+            return
+        rows: List[List[str]] = []
+        for gid, rec in wagons.items():
+            door = rec.get("door_state") or {}
+            dmg = rec.get("top_damage") or {}
+            cams = rec.get("camera_status") or {}
+            confirmed_cams = sorted(c for c, roles in cams.items()
+                                    if "CONFIRMED" in (roles or {}).values())
+            rows.append([
+                gid, str(rec.get("classification", "-")),
+                str(door.get("state") or "none"),
+                ("%.2f" % door.get("confidence", 0)) if door.get("state") else "-",
+                str(dmg.get("state") or "none"),
+                ("%.2f" % dmg.get("confidence", 0)) if dmg.get("state") else "-",
+                ",".join(c.replace("_UP", "").replace("RIGHT", "R")
+                         .replace("LEFT", "L") for c in confirmed_cams) or "-",
+            ])
+        per_page = 34
+        for start in range(0, len(rows), per_page):
+            chunk = rows[start:start + per_page]
+            p = self.new_page()
+            y = self._header(
+                p, "WAGON-BY-WAGON INSPECTION",
+                "wagons %d-%d of %d" % (start + 1, start + len(chunk), len(rows)))
+            self._table_block(
+                p, self.margin, y, self.w - 2 * self.margin, "",
+                ["GW", "type", "door", "conf", "top damage", "conf", "cameras"],
+                chunk)
+
+    def _add_inspection_diagnostics(self, insp: Dict[str, Any]) -> None:
+        """Rejected candidates are shown, never hidden -- this is for debugging."""
+        rejected = insp.get("rejected_events") or []
+        per_cam = insp.get("per_camera") or {}
+        p = self.new_page()
+        y = self._header(p, "INSPECTION DIAGNOSTICS",
+                         "raw / tracked / confirmed / rejected")
+
+        rows = []
+        for cam, roles in sorted(per_cam.items()):
+            for role, st in sorted((roles or {}).items()):
+                rows.append([cam, role, str(st.get("raw_detections", "-")),
+                             str(st.get("tracks", "-")),
+                             str(st.get("confirmed_tracks", "-")),
+                             str(st.get("rejected_tracks", "-")),
+                             "%ss" % st.get("seconds", 0)])
+        if rows:
+            y = self._table_block(
+                p, self.margin, y, self.w - 2 * self.margin,
+                "PER CAMERA AND ROLE",
+                ["camera", "role", "raw", "tracks", "confirmed", "rejected",
+                 "time"], rows)
+            y += int(self.s_body * 0.6)
+
+        if rejected:
+            rrows = []
+            for e in rejected[:26]:
+                rrows.append([
+                    str(e.get("camera_id", "-")),
+                    str(e.get("model_class_name", "-")),
+                    "%s" % e.get("n_observations", 0),
+                    "%.2f" % e.get("peak_confidence", 0),
+                    "%.0f" % e.get("displacement_px", 0),
+                    str(e.get("rejection_reason", ""))[:60]])
+            self._table_block(
+                p, self.margin, y, self.w - 2 * self.margin,
+                "REJECTED CANDIDATES (%d total%s" % (
+                    len(rejected),
+                    ", first 26 shown)" if len(rejected) > 26 else ")"),
+                ["camera", "class", "obs", "peak", "moved px", "why rejected"],
+                rrows)
+        else:
+            self._kv_block(p, self.margin, y, self.w - 2 * self.margin,
+                           "REJECTED CANDIDATES",
+                           [("none", "every tracked candidate was confirmed")])
+
     def add_event_page(self, ev: EventEvidence) -> None:
         w_obj = ev.wagon
         p = self.new_page()
@@ -1227,6 +1382,15 @@ def build_combined_report(
               "bitmap font (labels will look coarse)")
     builder.set_camera_aspects(tracks)
     builder.add_summary(state, tracks, events)
+    # Inspection sections sit between the summary and the per-wagon evidence
+    # gallery: downstream of counting, upstream of the evidence pages. Wrapped so
+    # an inspection-rendering fault can never destroy the counting report.
+    try:
+        builder.add_inspection_sections(state)
+    except Exception as exc:
+        if verbose:
+            print("  WARNING: inspection report section failed: %s: %s"
+                  % (type(exc).__name__, exc), file=sys.stderr)
     for ev in events:
         builder.add_event_page(ev)
     result["pages"] = len(builder.pages)

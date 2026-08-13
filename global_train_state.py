@@ -373,6 +373,14 @@ class GlobalTrainState:
 
     gap_validation_config: Dict[str, Any] = field(default_factory=dict)
 
+    inspection: Dict[str, Any] = field(default_factory=dict)
+    """Downstream inspection findings (door state, top damage), keyed by the GW
+    ids this state already contains.
+
+    Purely ADDITIVE: every pre-existing field keeps its meaning, and an empty
+    dict means inspection did not run. Nothing here participates in the count --
+    it annotates wagons that fusion already finalized."""
+
     fragment_stitching: Dict[str, Any] = field(default_factory=dict)
     """Per camera: which tracker fragments were reassembled into one physical gap
     before validation ran, plus the seams that were considered and refused.
@@ -455,6 +463,7 @@ class GlobalTrainState:
             "gap_validation_statistics": dict(self.gap_validation_statistics),
             "gap_validation_config": dict(self.gap_validation_config),
             "fragment_stitching": dict(self.fragment_stitching),
+            "inspection": dict(self.inspection),
             "wagon_active_recovery": dict(self.wagon_active_recovery),
             "gap_rejection_details": dict(self.gap_rejection_details),
         }

@@ -88,6 +88,10 @@ import train_structure as ts
 import temporal_classification as tcls
 import video_segmenter as vs
 import evidence_report as er
+import inspection as insp
+from inspection import detection as insp_detect
+from inspection import evidence as insp_evidence
+from inspection import models as insp_models
 
 
 # =============================================================================
@@ -249,6 +253,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "strips, so this MUST be much smaller than the side ratio.")
     p.add_argument("--classification-samples", type=int, default=5,
                    help="Frames per segment for side_classification.pt vote (default: 5)")
+
+    # ---- inspection: DOWNSTREAM features on the finished global train --------
+    _ic = insp.InspectionConfig()
+    p.add_argument("--no-inspection", action="store_true",
+                   help="Skip door/top-damage inspection entirely. The wagon "
+                        "count is unaffected either way.")
+    p.add_argument("--door-model", default=None,
+                   help="Path to door_state.pt (default: <models-dir>/door_state.pt)")
+    p.add_argument("--damage-model", default=None,
+                   help="Path to top_damage.pt (default: <models-dir>/top_damage.pt)")
+    p.add_argument("--inspection-confidence", type=float,
+                   default=_ic.min_detection_confidence,
+                   help="Detection floor for admitting a raw inspection detection "
+                        f"into tracking (default {_ic.min_detection_confidence})")
+    p.add_argument("--inspection-stride", type=int, default=_ic.frame_stride,
+                   help=f"Inspect every Nth frame (default {_ic.frame_stride})")
+    p.add_argument("--inspection-min-track-sec", type=float,
+                   default=_ic.min_track_seconds,
+                   help="Persistence in SECONDS required to confirm a finding "
+                        f"(default {_ic.min_track_seconds})")
+    p.add_argument("--inspection-min-peak-conf", type=float,
+                   default=_ic.min_peak_confidence,
+                   help="Peak confidence a confirmed finding must reach "
+                        f"(default {_ic.min_peak_confidence})")
 
     # ---- fragment reassembly: rebuild physical gaps before validating them ---
     _fs = fstitch.DEFAULT_FRAGMENT_STITCH
@@ -554,6 +582,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  side_classification.pt   : {side_cls_path}")
     print(f"  output root              : {args.output}")
     print()
+
+    # ------------------------------------------------------------------
+    # Inspection model availability, resolved UP FRONT.
+    #
+    # Deliberately before any video is touched: a missing or unloadable
+    # inspection model must be visible now, not after half an hour of tracking.
+    # Classes are read from the checkpoints and printed, so a silent class
+    # mismatch is impossible -- nothing downstream assumes what they are.
+    # ------------------------------------------------------------------
+    model_availability: Dict[str, insp_models.ModelAvailability] = {}
+    if not args.no_inspection:
+        print("-" * 70)
+        print("  INSPECTION MODELS")
+        print("-" * 70)
+        model_availability = insp_models.discover_models(
+            models_dir=args.models_dir,
+            door_path=args.door_model, damage_path=args.damage_model)
+        print(insp_models.describe_model_availability(model_availability))
+        if not any(a.is_available for a in model_availability.values()):
+            print("  NOTE: no inspection model is available -- the wagon count "
+                  "will still be produced in full, and the report will record "
+                  "the inspection stage as unavailable.", file=sys.stderr)
+        print()
 
     os.makedirs(args.output, exist_ok=True)
     # Only the overlay-video directory is pre-created, and only when asked for.
@@ -980,6 +1031,89 @@ def main(argv: Optional[List[str]] = None) -> int:
         state.add_note(note)
 
     # ------------------------------------------------------------------
+    # STEPS 8-11 -- INSPECTION (door state, top damage)
+    #
+    # Runs only now, AFTER the global wagon roster and GW ids are final. That
+    # ordering is the safety property: inspection reads `state.wagons` and
+    # `state.camera_offsets` and writes neither, so no detection can create,
+    # delete or renumber a wagon, move a boundary or disturb MASTER == GLOBAL.
+    #
+    # A wagon count that already succeeded must never be lost to an inspection
+    # problem, so every failure here degrades to a recorded warning.
+    # ------------------------------------------------------------------
+    inspection_state = None
+    if not args.no_inspection:
+        print()
+        print("-" * 70)
+        print("  STEPS 8-11  Inspection (door state, top damage)")
+        print("-" * 70)
+        _insp_t0 = time.time()
+        try:
+            insp_cfg = insp.InspectionConfig(
+                enabled=True,
+                min_detection_confidence=float(args.inspection_confidence),
+                frame_stride=int(args.inspection_stride),
+                min_track_seconds=float(args.inspection_min_track_sec),
+                min_peak_confidence=float(args.inspection_min_peak_conf),
+            )
+            count_before = len(state.wagons)
+            ids_before = [w.global_id for w in state.wagons]
+
+            inspection_state = insp_detect.run_inspection(
+                state=state, tracks_by_camera=tracks,
+                availability=model_availability, all_cameras=ALL_CAMERAS,
+                cfg=insp_cfg, verbose=verbose)
+
+            # Inspection is additive by construction; assert it, so a future
+            # change that breaks the guarantee fails loudly here rather than
+            # silently shipping a wrong count.
+            if len(state.wagons) != count_before or \
+                    [w.global_id for w in state.wagons] != ids_before:
+                raise AssertionError(
+                    "inspection altered the global wagon roster -- it must only "
+                    "annotate wagons that already exist")
+
+            # Evidence: select frames deterministically, then extract images.
+            insp_evidence.attach_evidence(
+                inspection_state.events, inspection_state.tracks_by_key, insp_cfg)
+            if not args.no_report:
+                _ev_dir = os.path.join(args.output, "inspection_evidence")
+                n_img = insp_evidence.extract_evidence_images(
+                    inspection_state.events,
+                    {cam: tracks[cam].video_path for cam in ALL_CAMERAS},
+                    _ev_dir, verbose=verbose)
+                inspection_state.timings["evidence_seconds"] = round(
+                    time.time() - _insp_t0, 2)
+                if verbose:
+                    print(f"    [EVIDENCE] {n_img} inspection evidence frame(s) "
+                          f"-> {_ev_dir}")
+            _c = inspection_state.counts()
+            print(f"  confirmed door findings   : {_c['confirmed_door_events']}")
+            print(f"  confirmed damage findings : {_c['confirmed_damage_events']}")
+            print(f"  rejected candidates       : {_c['rejected_events']}")
+            print(f"  unresolved associations   : {_c['unresolved_associations']}")
+            print(f"  association status        : "
+                  f"{inspection_state.association_status()}")
+        except Exception as exc:
+            msg = (f"inspection stage failed: {type(exc).__name__}: {exc} -- "
+                   f"the wagon count above is unaffected")
+            print(f"WARNING: {msg}", file=sys.stderr)
+            state.add_note(msg)
+            if inspection_state is not None:
+                inspection_state.warnings.append(msg)
+        finally:
+            _insp_elapsed = time.time() - _insp_t0
+            if inspection_state is not None:
+                inspection_state.timings["total_seconds"] = round(_insp_elapsed, 2)
+            print(f"  inspection elapsed        : {_insp_elapsed:.1f}s")
+    else:
+        print()
+        print("  Inspection SKIPPED (--no-inspection)")
+
+    if inspection_state is not None:
+        state.inspection = inspection_state.to_dict()
+
+    # ------------------------------------------------------------------
     # STEP 4 -- write JSON
     # ------------------------------------------------------------------
     state_json_path = os.path.join(args.output, "global_train_state.json")
@@ -1033,6 +1167,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     time_offset=offsets.get(cam, 0.0),
                     drop_out_of_range=(state.fusion_mode == "master-fixed"),
                     non_wagon_regions=non_wagon_regions,
+                    inspection_events=((state.inspection or {}).get("events") or []),
                 )
             except Exception as e:
                 print(f"WARNING: render failed for {cam}: {e}", file=sys.stderr)

@@ -168,6 +168,12 @@ def _interp_gap_bbox(gap: GapEvent, frame_idx: int) -> Optional[List[float]]:
     return list(bh[-1])
 
 
+# Inspection overlay colours, distinct from the gap/wagon palette so a reviewer
+# can tell a counting overlay from an inspection finding at a glance.
+_DOOR_BOX_COLOR = (0, 200, 255)      # amber
+_DAMAGE_BOX_COLOR = (0, 0, 255)      # red
+
+
 def _draw_info_panel(
     frame: np.ndarray,
     lines: List[Tuple[str, Tuple[int, int, int]]],
@@ -199,6 +205,7 @@ def render_processed_video(
     time_offset: float = 0.0,
     drop_out_of_range: bool = False,
     non_wagon_regions: Optional[List[Dict]] = None,
+    inspection_events: Optional[List[Dict]] = None,
 ) -> str:
     """Render the overlay video for ONE camera.
 
@@ -218,6 +225,12 @@ def render_processed_video(
     drop_out_of_range :
         When True, global wagons outside this camera's footage are not drawn at
         all rather than being clamped onto the final frame.
+    inspection_events :
+        Confirmed door / top-damage findings for THIS camera, already associated
+        to a GW id upstream.  Drawn from the finished inspection record, so the
+        video and the PDF report always state the same finding for the same
+        wagon.  Purely additive: the gap and wagon overlays are untouched, and no
+        detection drawn here can alter a GW id.
     non_wagon_regions :
         Leading / trailing / interior ENGINE and BRAKE_VAN regions in MASTER
         time, as produced by ``train_structure.WagonWindow.summary()``. The full
@@ -279,6 +292,13 @@ def render_processed_video(
         print(f"  {local_tracks.total_frames} frames, {len(state.wagons)} wagons projected")
 
     frame_idx = 0
+    # Index this camera's confirmed findings by frame span, once. Kept as plain
+    # numbers so the draw loop never holds anything image-sized.
+    _insp_by_camera: List[Dict] = [
+        e for e in (inspection_events or [])
+        if e.get("camera_id") == local_tracks.camera_id and e.get("confirmed", True)
+    ]
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -384,6 +404,37 @@ def render_processed_video(
                            _INFO_TEXT_COLOR))
         if state.fallback_used:
             info_lines.append(("FALLBACK MODE (pure RIGHT_UP)", (0, 0, 255)))
+
+        # ---- inspection overlays (additive) ----------------------------
+        _active_findings = [e for e in _insp_by_camera
+                            if e.get("start_frame", 0) <= frame_idx
+                            <= e.get("end_frame", -1)]
+        for _ev in _active_findings:
+            _bbox = _ev.get("peak_bbox")
+            if _bbox:
+                x1, y1, x2, y2 = (int(v) for v in _bbox)
+                _col = (_DOOR_BOX_COLOR if _ev.get("role") == "door"
+                        else _DAMAGE_BOX_COLOR)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), _col, 2)
+                _gw = _ev.get("global_id") or "UNRESOLVED"
+                cv2.putText(frame, _gw, (x1 + 4, max(16, y1 - 22)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, _col, 2, cv2.LINE_AA)
+                cv2.putText(frame,
+                            f"{_ev.get('model_class_name', '?')} "
+                            f"{float(_ev.get('peak_confidence', 0.0)):.2f}",
+                            (x1 + 4, max(30, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, _col, 2, cv2.LINE_AA)
+        # One line per role in the panel, so a reviewer sees the attribution
+        # without the frame becoming unreadable.
+        for _role, _label, _col in (("door", "Door", _DOOR_BOX_COLOR),
+                                    ("top_damage", "Top damage", _DAMAGE_BOX_COLOR)):
+            _hits = [e for e in _active_findings if e.get("role") == _role]
+            if _hits:
+                _b = max(_hits, key=lambda e: float(e.get("peak_confidence", 0.0)))
+                info_lines.append((
+                    f"{_label + ':':<21} {_b.get('model_class_name', '?')} "
+                    f"{float(_b.get('peak_confidence', 0.0)):.2f}  "
+                    f"[{_b.get('global_id') or 'UNRESOLVED'}]", _col))
 
         _draw_info_panel(frame, info_lines)
 
