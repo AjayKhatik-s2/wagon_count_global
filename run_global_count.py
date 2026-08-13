@@ -561,8 +561,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     for cam in ALL_CAMERAS:
         t = tracks[cam]
         raw_n = sum(len(v) for v in (t.raw_frame_detections or {}).values())
+        # Geometry is passed per camera so thresholds resolve from THIS camera's
+        # own resolution and frame rate -- nothing is assumed about either.
         res = gval.validate_gap_events(t.gaps, cam, gv_cfg,
-                                       raw_detection_count=raw_n, verbose=verbose)
+                                       raw_detection_count=raw_n, verbose=verbose,
+                                       frame_width=t.width, fps=t.fps)
         gap_validation[cam] = res
         # Replace the camera's gap list with the validated subset and restore
         # track_id as a contiguous temporal rank, as the tracker produces.

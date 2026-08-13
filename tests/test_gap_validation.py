@@ -150,7 +150,8 @@ class TestMultiSignal(unittest.TestCase):
         self.assertEqual(reasons(res)[1], gv.REJECTED_LOW_CONFIDENCE)
 
     def test_implausibly_fast_is_rejected(self):
-        cfg = gv.GapValidationConfig(max_motion_px_per_sec=600.0)
+        # 600 px/s on an 848 px frame, expressed camera-independently
+        cfg = gv.GapValidationConfig(max_motion_frac_per_sec=600.0 / 848)
         g = track(1, 100, 5, 0.0, 848.0, step=1)      # 848 px in 0.33 s
         res = validate([g], cfg=cfg)
         self.assertEqual(reasons(res)[1], gv.REJECTED_IMPLAUSIBLE_SPEED)
@@ -283,10 +284,17 @@ class TestDiagnostics(unittest.TestCase):
 
     def test_config_is_fully_serializable(self):
         d = gv.GapValidationConfig().describe()
-        for key in ("min_motion_px", "static_max_motion_px",
+        for key in ("min_motion_frac", "static_max_motion_frac",
                     "train_motion_tolerance", "min_mean_confidence",
-                    "max_detection_gap_frames", "min_monotonic_fraction"):
+                    "max_detection_gap_seconds", "min_monotonic_fraction",
+                    "min_separation_seconds"):
             self.assertIn(key, d)
+        # ...and every distance/duration threshold must be camera-independent
+        for key in d:
+            self.assertFalse(key.endswith("_px") or key.endswith("_frames"),
+                             f"{key} is in absolute units; thresholds must be "
+                             f"frame-width fractions or seconds so they "
+                             f"generalize across trains and camera geometry")
 
     def test_motion_features_match_the_measured_values(self):
         """Feature extraction must reproduce a real measured track."""

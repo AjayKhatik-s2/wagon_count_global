@@ -104,8 +104,53 @@ ALL_REJECTION_REASONS = (
 # =============================================================================
 
 @dataclass
+class ResolvedThresholds:
+    """Config thresholds resolved into this camera's own pixels and frames.
+
+    Produced by ``GapValidationConfig.resolve(frame_width, fps)``. Every value
+    here is camera-specific and computed at runtime -- nothing is baked in from
+    any particular train or camera geometry.
+    """
+    frame_width: int
+    fps: float
+    min_track_frames: int
+    max_detection_gap_frames: int
+    min_motion_px: float
+    static_max_motion_px: float
+    min_motion_px_per_sec: float
+    max_motion_px_per_sec: float
+    duplicate_max_center_px: float
+    min_separation_frames: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {k: getattr(self, k) for k in self.__dataclass_fields__}
+        for k, v in list(d.items()):
+            if isinstance(v, float):
+                d[k] = round(v, 4)
+        return d
+
+
+@dataclass
 class GapValidationConfig:
     """Thresholds for turning gap tracks into wagon-boundary candidates.
+
+    GENERALIZATION: thresholds are stored in CAMERA-INDEPENDENT units -- fractions
+    of frame width for distances, seconds for durations, and dimensionless ratios
+    -- and are resolved to this camera's pixels and frames at runtime by
+    ``resolve(frame_width, fps)``.
+
+    This matters because the same pipeline processes many trains on differing
+    hardware. An absolute "4 px" static threshold calibrated at 848x480 becomes
+    2.3x more permissive at 1920x1080 (the same physical jitter spans more
+    pixels), so a stationary artefact would stop being rejected. An absolute
+    "4 frame" minimum becomes half the wall-clock time at 30 fps. Relative units
+    remove both failure modes.
+
+    The numeric defaults below were MEASURED on the local development train and
+    are initial defaults, not production invariants. They are expressed relative
+    to that train's 848x480 @ 15 fps geometry so they carry over to other
+    geometries; they still need confirming against additional trains before being
+    treated as settled.
 
     Defaults were chosen from MEASURED behaviour of the real gap tracks on this
     project's videos (848x480 @ 15 fps). The measurement ran the EXISTING tracker
@@ -132,10 +177,11 @@ class GapValidationConfig:
     """Master switch. False = emit every tracked gap (previous behaviour)."""
 
     # ---- 1. temporal persistence ----------------------------------------
-    min_track_frames: int = 4
-    """Minimum track extent (end_frame - start_frame + 1). The tracker already
+    min_track_seconds: float = 0.27
+    """Minimum track extent in SECONDS (fps-independent). The tracker already
     requires min_hits=3 to confirm a track, so this mostly guards against a
-    track that is confirmed but collapses into almost no time span."""
+    track that is confirmed but collapses into almost no time span.
+    Measured default: 4 frames at 15 fps."""
 
     min_hits: int = 3
     """Minimum number of frames the gap was actually detected. Matches the
@@ -143,38 +189,39 @@ class GapValidationConfig:
     self-contained and auditable."""
 
     # ---- 2. detection continuity ----------------------------------------
-    max_detection_gap_frames: int = 20
-    """Longest run of consecutive MISSED frames tolerated inside one track.
-    A track may legitimately look like HIT HIT HIT MISS HIT HIT; a track that is
-    mostly blind is treated cautiously. The tracker closes a track after 30
-    consecutive misses, so this is stricter than the tracker but still allows a
-    1.3 s occlusion at 15 fps."""
+    max_detection_gap_seconds: float = 1.33
+    """Longest MISSED stretch tolerated inside one track, in SECONDS. A track may
+    legitimately look like HIT HIT HIT MISS HIT HIT; a mostly-blind track is
+    treated cautiously. Measured default: 20 frames at 15 fps."""
 
     min_coverage: float = 0.20
     """hits / track_extent. Guards the HIT MISS MISS MISS MISS HIT shape."""
 
     # ---- 3. motion ------------------------------------------------------
-    min_motion_px: float = 12.0
-    """Minimum absolute displacement of the smoothed centre over the track, in
-    pixels. Measured: the smallest displacement of any REAL gap was 110.7 px, so
-    this leaves a ~9x margin while still excluding near-stationary detections.
-    On an 848 px wide frame it is ~1.4% of the width."""
+    min_motion_frac: float = 0.0142
+    """Minimum centre displacement over the track, as a FRACTION OF FRAME WIDTH.
+    Measured: the smallest displacement of any real gap was 110.7 px of 848
+    (13.1% of width), so this ~1.4% floor leaves roughly a 9x margin while still
+    excluding near-stationary detections."""
 
-    static_max_motion_px: float = 4.0
-    """At or below this displacement the track is reported as REJECTED_STATIC
-    rather than REJECTED_LOW_MOTION, so genuinely pinned artefacts (rails,
-    sleepers, poles, markings, shadows) are distinguishable in the diagnostics.
-    Measured: the three confirmed false positives moved 0.0 px; the smallest real
-    gap moved 110.7 px. Any value in between separates them; 4.0 px is chosen to
-    absorb Kalman jitter without approaching a real gap's motion."""
+    static_max_motion_frac: float = 0.0047
+    """At or below this displacement (FRACTION OF FRAME WIDTH) the track is
+    reported as REJECTED_STATIC rather than REJECTED_LOW_MOTION, so pinned
+    artefacts (rails, sleepers, poles, markings, shadows) are distinguishable in
+    the diagnostics. Measured: the three confirmed false positives moved <=0.2 px
+    of 848 while the smallest real gap moved 110.7 px, so anything in between
+    separates them; ~0.5% of width absorbs Kalman jitter without approaching a
+    real gap's motion. Being width-relative is essential -- a fixed 4 px would
+    stop rejecting static objects at higher resolutions."""
 
     # ---- 4. speed plausibility ------------------------------------------
-    min_motion_px_per_sec: float = 8.0
-    max_motion_px_per_sec: float = 2000.0
-    """Plausible band for apparent speed. Wide on purpose: perspective makes the
-    same physical gap appear to move at very different pixel rates on side
-    versus top cameras and across the frame. The band is meant to exclude the
-    physically absurd, not to enforce a single expected speed."""
+    min_motion_frac_per_sec: float = 0.0094
+    max_motion_frac_per_sec: float = 2.36
+    """Plausible band for apparent speed, in FRACTIONS OF FRAME WIDTH per second.
+    Wide on purpose: perspective makes the same physical gap move at very
+    different rates on side versus top cameras and across the frame, and trains
+    accelerate. The band excludes the physically absurd, not a specific expected
+    speed. Measured defaults: 8 and 2000 px/s at 848 px width."""
 
     # ---- 5. trajectory consistency --------------------------------------
     min_monotonic_fraction: float = 0.60
@@ -236,9 +283,46 @@ class GapValidationConfig:
     distinct inter-wagon gaps are temporally disjoint, so this rule cannot merge
     two real wagons."""
 
-    duplicate_max_center_px: float = 120.0
-    """...and their centre columns must also be within this distance, i.e. the
-    two tracks are following the same object in the same part of the image."""
+    duplicate_max_center_frac: float = 0.1415
+    """...and their centre columns must also be within this distance (FRACTION OF
+    FRAME WIDTH), i.e. the two tracks follow the same object in the same part of
+    the image. Measured default: 120 px at 848 px width."""
+
+    min_separation_seconds: float = 0.67
+    """Minimum time between two consecutive VALIDATED physical gap events.
+
+    A measured physical constraint of the observed train: consecutive real wagon
+    gaps were never closer than ~10 frames at 15 fps. Stored in SECONDS so it
+    transfers to other frame rates, and applied ONLY to final validated events --
+    never to raw detections, which legitimately cluster because several belong to
+    one track.
+
+    Treated as an initial measured default, not a production invariant: a shorter
+    wagon or a faster train could in principle produce closer boundaries, so a
+    violation is resolved as a suspected duplicate/fragmentation WITH diagnostics
+    rather than silently deleted."""
+
+    def resolve(self, frame_width: int, fps: float) -> ResolvedThresholds:
+        """Resolve camera-independent thresholds into this camera's units.
+
+        Falls back to the development geometry only when a camera reports no
+        usable width or fps, so a malformed stream cannot silently disable
+        validation.
+        """
+        w = int(frame_width) if frame_width and frame_width > 0 else 848
+        f = float(fps) if fps and fps > 0 else 15.0
+        return ResolvedThresholds(
+            frame_width=w, fps=f,
+            min_track_frames=max(2, int(round(self.min_track_seconds * f))),
+            max_detection_gap_frames=max(
+                1, int(round(self.max_detection_gap_seconds * f))),
+            min_motion_px=self.min_motion_frac * w,
+            static_max_motion_px=self.static_max_motion_frac * w,
+            min_motion_px_per_sec=self.min_motion_frac_per_sec * w,
+            max_motion_px_per_sec=self.max_motion_frac_per_sec * w,
+            duplicate_max_center_px=self.duplicate_max_center_frac * w,
+            min_separation_frames=max(1, int(round(self.min_separation_seconds * f))),
+        )
 
     def describe(self) -> Dict[str, Any]:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -310,6 +394,8 @@ class GapValidationResult:
     tracked_candidate_count: int = 0
     train_reference_speed: Optional[float] = None
     config_used: Dict[str, Any] = field(default_factory=dict)
+    resolved_thresholds: Dict[str, Any] = field(default_factory=dict)
+    """The camera-independent config resolved into this camera's px/frames."""
 
     @property
     def rejection_counts(self) -> Dict[str, int]:
@@ -329,6 +415,7 @@ class GapValidationResult:
             "train_reference_speed_px_per_sec": (
                 round(self.train_reference_speed, 2)
                 if self.train_reference_speed is not None else None),
+            "resolved_thresholds": dict(self.resolved_thresholds),
         }
         if include_rejections:
             d["rejections"] = [r.to_dict() for r in self.rejected]
@@ -423,6 +510,8 @@ def validate_gap_events(
     cfg: GapValidationConfig = DEFAULT_GAP_VALIDATION,
     raw_detection_count: int = 0,
     verbose: bool = True,
+    frame_width: int = 0,
+    fps: float = 0.0,
 ) -> GapValidationResult:
     """Filter tracked gap candidates down to physically plausible wagon boundaries.
 
@@ -430,11 +519,19 @@ def validate_gap_events(
     accepted/rejected split. Nothing is discarded silently -- every rejection
     carries its reason and its measured features.
     """
+    # Resolve camera-independent thresholds into THIS camera's pixels/frames.
+    # Geometry comes from the caller, or from the gaps themselves as a fallback,
+    # so nothing is assumed about resolution or frame rate.
+    if not fps:
+        fps = next((g.fps for g in gaps if g.fps), 0.0)
+    res_thr = cfg.resolve(frame_width, fps)
+
     result = GapValidationResult(
         camera_id=camera_id,
         raw_detection_count=raw_detection_count,
         tracked_candidate_count=len(gaps),
         config_used=cfg.describe(),
+        resolved_thresholds=res_thr.to_dict(),
     )
 
     if not cfg.enabled:
@@ -474,19 +571,19 @@ def validate_gap_events(
         detail = ""
 
         # 1. temporal persistence
-        if f.track_frames < cfg.min_track_frames:
+        if f.track_frames < res_thr.min_track_frames:
             reason = REJECTED_TOO_SHORT
             detail = (f"track spans {f.track_frames} frame(s) "
-                      f"< min_track_frames={cfg.min_track_frames}")
+                      f"< min_track_frames={res_thr.min_track_frames}")
         elif f.hits < cfg.min_hits:
             reason = REJECTED_TOO_SHORT
             detail = f"only {f.hits} hit(s) < min_hits={cfg.min_hits}"
 
         # 2. detection continuity
-        elif f.max_detection_gap > cfg.max_detection_gap_frames:
+        elif f.max_detection_gap > res_thr.max_detection_gap_frames:
             reason = REJECTED_DETECTION_GAP
             detail = (f"longest blind run {f.max_detection_gap} frame(s) "
-                      f"> max_detection_gap_frames={cfg.max_detection_gap_frames}")
+                      f"> max_detection_gap_frames={res_thr.max_detection_gap_frames}")
         elif f.coverage < cfg.min_coverage:
             reason = REJECTED_DETECTION_GAP
             detail = (f"coverage {f.coverage:.2f} < min_coverage={cfg.min_coverage} "
@@ -499,26 +596,26 @@ def validate_gap_events(
                       f"< min_mean_confidence={cfg.min_mean_confidence}")
 
         # 4. motion: static artefacts are called out explicitly
-        elif f.abs_displacement_px <= cfg.static_max_motion_px:
+        elif f.abs_displacement_px <= res_thr.static_max_motion_px:
             reason = REJECTED_STATIC
             detail = (f"centre moved {f.abs_displacement_px:.1f} px over "
                       f"{f.duration_s:.2f}s (<= static_max_motion_px="
-                      f"{cfg.static_max_motion_px}); the train is moving, so a "
+                      f"{res_thr.static_max_motion_px}); the train is moving, so a "
                       f"pinned detection is background, not a wagon gap")
-        elif f.abs_displacement_px < cfg.min_motion_px:
+        elif f.abs_displacement_px < res_thr.min_motion_px:
             reason = REJECTED_LOW_MOTION
             detail = (f"centre moved only {f.abs_displacement_px:.1f} px "
-                      f"< min_motion_px={cfg.min_motion_px}")
+                      f"< min_motion_px={res_thr.min_motion_px}")
 
         # 5. speed plausibility
-        elif f.velocity_px_per_sec < cfg.min_motion_px_per_sec:
+        elif f.velocity_px_per_sec < res_thr.min_motion_px_per_sec:
             reason = REJECTED_IMPLAUSIBLE_SPEED
             detail = (f"apparent speed {f.velocity_px_per_sec:.1f} px/s "
-                      f"< min_motion_px_per_sec={cfg.min_motion_px_per_sec}")
-        elif f.velocity_px_per_sec > cfg.max_motion_px_per_sec:
+                      f"< min_motion_px_per_sec={res_thr.min_motion_px_per_sec}")
+        elif f.velocity_px_per_sec > res_thr.max_motion_px_per_sec:
             reason = REJECTED_IMPLAUSIBLE_SPEED
             detail = (f"apparent speed {f.velocity_px_per_sec:.1f} px/s "
-                      f"> max_motion_px_per_sec={cfg.max_motion_px_per_sec}")
+                      f"> max_motion_px_per_sec={res_thr.max_motion_px_per_sec}")
 
         # 6. trajectory consistency
         elif (f.n_steps >= cfg.min_steps_for_trajectory
@@ -586,7 +683,7 @@ def validate_gap_events(
             for kg, kf in deduped:
                 if (_time_overlap_fraction(g, kg) >= cfg.duplicate_min_time_overlap
                         and abs(f.center_start - kf.center_start)
-                        <= cfg.duplicate_max_center_px):
+                        <= res_thr.duplicate_max_center_px):
                     clash = (kg, kf)
                     break
             if clash is None:

@@ -197,8 +197,24 @@ class WagonWindow:
     wagon_units: List[GlobalWagon] = field(default_factory=list)
 
     leading_non_wagon_objects: List[NonWagonObject] = field(default_factory=list)
+    """Segments before the first WAGON. Outside the window -> NO GW id."""
+
     trailing_non_wagon_objects: List[NonWagonObject] = field(default_factory=list)
+    """Segments after the last WAGON. Outside the window -> NO GW id."""
+
     interior_non_wagon_objects: List[NonWagonObject] = field(default_factory=list)
+    """ENGINE / BRAKE_VAN labels found INSIDE the wagon window.
+
+    These are recorded as classification ANOMALIES and are STILL COUNTED. The
+    RIGHT_UP master gap sequence is authoritative: every segment between the
+    first and last wagon is bounded by validated master gaps, so an interior
+    engine/brake-van label is a classification error, not grounds to delete a
+    master wagon or renumber GW ids.
+
+    Excluding them (the original behaviour) let a single misclassification
+    silently remove a wagon from the authoritative count -- classification
+    controlling an individual wagon, which it must never do. Classification
+    decides only where the window starts and ends."""
 
     total_segments: int = 0
 
@@ -231,6 +247,8 @@ class WagonWindow:
             "leading_non_wagon_count": len(self.leading_non_wagon_objects),
             "trailing_non_wagon_count": len(self.trailing_non_wagon_objects),
             "interior_non_wagon_count": len(self.interior_non_wagon_objects),
+            "interior_classification_anomalies": len(self.interior_non_wagon_objects),
+            "interior_anomalies_are_still_counted": True,
             "leading_non_wagon_classes": _cls_counts(self.leading_non_wagon_objects),
             "trailing_non_wagon_classes": _cls_counts(self.trailing_non_wagon_objects),
             "interior_non_wagon_classes": _cls_counts(self.interior_non_wagon_objects),
@@ -320,10 +338,15 @@ def get_master_wagon_window(
             win.leading_non_wagon_objects.append(_as_non_wagon(s, i, "leading"))
         elif i > lw:
             win.trailing_non_wagon_objects.append(_as_non_wagon(s, i, "trailing"))
-        elif s.classification in NON_WAGON_CLASSES:
-            # Inside the window but explicitly not a wagon: never gets a GW id.
-            win.interior_non_wagon_objects.append(_as_non_wagon(s, i, "interior"))
         else:
+            # INSIDE the window. Every segment here is bounded by validated
+            # RIGHT_UP master gaps, which are authoritative, so it counts as a
+            # wagon regardless of its label. An ENGINE / BRAKE_VAN label inside
+            # the window is recorded as a classification anomaly -- it must not
+            # delete a master wagon or renumber GW ids.
+            if s.classification in NON_WAGON_CLASSES:
+                win.interior_non_wagon_objects.append(
+                    _as_non_wagon(s, i, "interior"))
             win.wagon_units.append(s)
 
     # Renumber the survivors GW_1..GW_N, preserving the existing naming scheme.

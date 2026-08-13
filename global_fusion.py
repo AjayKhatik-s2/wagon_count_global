@@ -289,9 +289,18 @@ class CameraOffset:
     n_missing: int = 0
     n_extra: int = 0
     pattern_penalty: float = 0.0
-    stability: Optional[float] = None
-    """Fraction of perturbed re-estimates reproducing this offset. None when the
-    check was not needed (the margin was already decisive)."""
+    alias_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    """Whole-wagon-shift hypotheses (k = -1, 0, +1) scored explicitly, best
+    first. A support camera lagging or leading by exactly one wagon is the alias
+    most likely to look correct on timestamps alone."""
+
+    alias_best_k: Optional[int] = None
+    """Which shift scored best. 0 means the unshifted offset won."""
+
+    alias_conflict: bool = False
+    """True when a whole-wagon shift explains the data BETTER than the winner --
+    the offset is then not decisive, whatever the margin says."""
+
     accepted_via: str = ""
     """'margin' or 'stability' -- which route accepted the offset."""
     reason: str = ""
@@ -313,8 +322,9 @@ class CameraOffset:
             "n_missing": self.n_missing,
             "n_extra": self.n_extra,
             "pattern_penalty": round(self.pattern_penalty, 4),
-            "stability": (round(self.stability, 4)
-                          if self.stability is not None else None),
+            "alias_candidates": list(self.alias_candidates),
+            "alias_best_k": self.alias_best_k,
+            "alias_conflict": self.alias_conflict,
             "accepted_via": self.accepted_via,
             "reason": self.reason,
         }
@@ -639,6 +649,57 @@ def _offset_score(
     return cost + cfg.pattern_weight * pattern, pattern, pairs, missing, extra
 
 
+@dataclass
+class AliasCandidate:
+    """One whole-wagon-shift hypothesis considered during offset estimation."""
+    k: int                      # shift in wagon periods: -1, 0, +1, ...
+    delta: float
+    score: float
+    n_match: int
+    n_extra: int
+    pattern_penalty: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"k": self.k, "delta": round(self.delta, 4),
+                "score": round(self.score, 4), "n_match": self.n_match,
+                "n_extra": self.n_extra,
+                "pattern_penalty": round(self.pattern_penalty, 4)}
+
+
+def evaluate_wagon_alias_candidates(
+    master_obs: Sequence[GapObservation],
+    support_obs: Sequence[GapObservation],
+    delta: float,
+    cfg: FusionConfig = DEFAULT_CONFIG,
+    k_range: Sequence[int] = (-1, 0, 1),
+) -> List[AliasCandidate]:
+    """Score `delta` shifted by whole wagon periods: k = -1, 0, +1, ...
+
+    A support camera can lag or lead the master by exactly one wagon, and because
+    wagon spacing is quasi-periodic such a shift produces a deceptively good
+    timestamp alignment. This makes that hypothesis explicit rather than implicit:
+    each candidate is scored with the same DP + interval-pattern objective, so the
+    local spacing pattern -- not raw timestamp closeness -- decides between them.
+
+    The wagon period is derived at RUNTIME from the master's own median gap
+    spacing, so nothing about any particular train's spacing is assumed.
+
+    Returns one AliasCandidate per k, best (lowest) score first.
+    """
+    period = _median_spacing(master_obs)
+    out: List[AliasCandidate] = []
+    if period <= 0:
+        return out
+    for k in k_range:
+        d = delta + k * period
+        score, pattern, pairs, _miss, extra = _offset_score(
+            master_obs, support_obs, d, cfg)
+        out.append(AliasCandidate(k=k, delta=d, score=score, n_match=len(pairs),
+                                  n_extra=len(extra), pattern_penalty=pattern))
+    out.sort(key=lambda c: (c.score, abs(c.k)))
+    return out
+
+
 def estimate_camera_offset(
     master_obs: Sequence[GapObservation],
     support_obs: Sequence[GapObservation],
@@ -713,6 +774,20 @@ def estimate_camera_offset(
     off.n_match, off.n_missing, off.n_extra = n_match, n_missing, n_extra
     off.runner_up_delta = runner[0] if runner else None
 
+    # ---- explicit whole-wagon alias check (k-1 / k / k+1) ----
+    # A one-wagon lag or lead is the alias most likely to look correct, so it is
+    # tested explicitly and recorded. If a shifted hypothesis scores better than
+    # the winner, the winner is not decisive and the camera must not be trusted.
+    aliases = evaluate_wagon_alias_candidates(master_obs, support_obs,
+                                              best_delta, cfg)
+    off.alias_candidates = [c.to_dict() for c in aliases]
+    if aliases:
+        best_alias = aliases[0]
+        off.alias_best_k = best_alias.k
+        if best_alias.k != 0 and best_alias.score < best_score:
+            # A whole-wagon shift explains the data better than the winner.
+            off.alias_conflict = True
+
     # ---- decisiveness tests (M2) ----
     if runner is None:
         off.margin_ratio = float("inf")
@@ -734,6 +809,16 @@ def estimate_camera_offset(
         off.reason = (f"only {n_match} of a possible "
                       f"{min(len(master_obs), len(support_obs))} observations matched "
                       f"(need >= {min_match})")
+    elif off.alias_conflict:
+        best_alias = aliases[0]
+        off.status = OFFSET_UNRESOLVED
+        off.reason = (
+            f"whole-wagon alias conflict: shifting the offset by k="
+            f"{best_alias.k:+d} wagon period(s) to {best_alias.delta:+.2f}s "
+            f"scores {best_alias.score:.2f}, better than the winner "
+            f"{best_delta:+.2f}s at {best_score:.2f}. A one-wagon lag or lead "
+            f"cannot be ruled out, so this camera contributes no evidence rather "
+            f"than risk attributing it to the wrong wagon.")
     elif off.margin_ratio < cfg.offset_min_margin_ratio:
         off.status = OFFSET_UNRESOLVED
         off.reason = (f"ambiguous: best delta={best_delta:+.2f}s scores "
@@ -1082,25 +1167,39 @@ def assert_invariants(
     # 13/14. ONLY WAGONS ARE COUNTED -- no engine or brake van may hold a GW id.
     # Checked only under wagon-only counting; `--no-wagon-only` deliberately
     # reproduces the older "every segment is a wagon" behaviour for A/B runs.
+    # 13/14. LEADING and TRAILING engine / brake van never hold a GW id.
+    #
+    # INTERIOR engine / brake-van labels are a different case and are DELIBERATELY
+    # counted: they sit between validated master gaps, so they are classification
+    # anomalies, and letting one delete a wagon would put classification in
+    # control of an individual wagon. They are reported via
+    # `interior_classification_anomalies` instead.
     n_bad_class = 0
     if wagon_window is not None:
+        outside = {id(o) for o in (wagon_window.leading_non_wagon_objects
+                                   + wagon_window.trailing_non_wagon_objects)}
+        lead_trail_frames = {
+            (o.start_frame, o.end_frame)
+            for o in (wagon_window.leading_non_wagon_objects
+                      + wagon_window.trailing_non_wagon_objects)}
         for w in wagons:
-            if w.classification in (SegmentClass.ENGINE, SegmentClass.BRAKE_VAN):
+            if (w.start_frame_master, w.end_frame_master) in lead_trail_frames:
                 n_bad_class += 1
-                problems.append(f"{w.global_id} is classified {w.classification} "
-                                f"but holds a wagon id; engines and brake vans "
-                                f"must never receive one")
+                problems.append(
+                    f"{w.global_id} is a leading/trailing non-wagon segment but "
+                    f"holds a wagon id; only the wagon window may be counted")
 
     if wagon_window is not None:
         if len(wagons) != wagon_window.master_wagon_count:
             problems.append(f"total_wagons={len(wagons)} != wagon window count "
                             f"{wagon_window.master_wagon_count}")
-        # Non-wagon objects are preserved, and are outside the counted set.
+        # Only leading/trailing segments are excluded from the count. Interior
+        # anomalies are counted, so they are NOT part of `excluded`.
         excluded = (len(wagon_window.leading_non_wagon_objects)
-                    + len(wagon_window.trailing_non_wagon_objects)
-                    + len(wagon_window.interior_non_wagon_objects))
+                    + len(wagon_window.trailing_non_wagon_objects))
         if len(wagons) + excluded != wagon_window.total_segments:
-            problems.append(f"wagons({len(wagons)}) + non-wagon({excluded}) != "
+            problems.append(f"wagons({len(wagons)}) + leading/trailing"
+                            f"({excluded}) != "
                             f"segments({wagon_window.total_segments}): a segment "
                             f"was lost or double-counted")
         collapsed = expected - wagon_window.total_segments
@@ -1182,9 +1281,11 @@ def assert_invariants(
         "non_wagon_excluded": (
             len(wagon_window.leading_non_wagon_objects)
             + len(wagon_window.trailing_non_wagon_objects)
-            + len(wagon_window.interior_non_wagon_objects)
             if wagon_window is not None else 0),
-        "engine_or_brakevan_with_wagon_id": n_bad_class,
+        "interior_classification_anomalies_counted": (
+            len(wagon_window.interior_non_wagon_objects)
+            if wagon_window is not None else 0),
+        "leading_or_trailing_with_wagon_id": n_bad_class,
         "invariant_holds": not problems,
         "violations": problems,
         "checks_run": 14,

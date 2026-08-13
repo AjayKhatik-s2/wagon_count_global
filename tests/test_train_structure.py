@@ -135,13 +135,46 @@ class TestWagonOnlyCounting(unittest.TestCase):
         for w in st.wagons:
             self.assertNotIn(w.classification, (E, B))
 
-    def test_interior_engine_is_excluded_from_the_count(self):
-        """An engine between wagons still never receives a GW id."""
+    def test_interior_engine_anomaly_does_not_delete_a_wagon(self):
+        """An interior ENGINE label must NOT remove a master wagon.
+
+        The segment sits between two validated RIGHT_UP master gaps, so it is a
+        wagon boundary region by construction. An engine label there is a
+        classification anomaly; letting it delete a wagon would put
+        classification in control of an individual wagon, which it must never be.
+        """
         master, cls = segments_and_labels([E, W, W, E, W, W, B])
         st = assemble(master, [], cls)
-        self.assertEqual(st.total_wagons, 4)
-        self.assertEqual(st.wagon_window["interior_non_wagon_count"], 1)
-        self.assertEqual(st.wagon_window["interior_non_wagon_classes"], {E: 1})
+        # 5 interior segments (indices 1..5), all counted
+        self.assertEqual(st.total_wagons, 5)
+        self.assertEqual([w.global_id for w in st.wagons],
+                         ["GW_1", "GW_2", "GW_3", "GW_4", "GW_5"])
+        # ...and the anomaly is reported, not hidden
+        self.assertEqual(st.wagon_window["interior_classification_anomalies"], 1)
+        self.assertTrue(st.wagon_window["interior_anomalies_are_still_counted"])
+        self.assertTrue(st.invariant_checks["invariant_holds"])
+        self.assertEqual(
+            st.invariant_checks["interior_classification_anomalies_counted"], 1)
+
+    def test_interior_brakevan_anomaly_does_not_delete_a_wagon(self):
+        master, cls = segments_and_labels([E, W, W, B, W, W, B])
+        st = assemble(master, [], cls)
+        self.assertEqual(st.total_wagons, 5)
+        self.assertEqual(st.wagon_window["interior_classification_anomalies"], 1)
+        self.assertTrue(st.invariant_checks["invariant_holds"])
+
+    def test_gw_ids_are_not_renumbered_by_an_interior_anomaly(self):
+        """The same master gaps must yield the same ids with or without the
+        interior anomaly."""
+        clean, cls_clean = segments_and_labels([E, W, W, W, W, W, B])
+        anom, cls_anom = segments_and_labels([E, W, W, E, W, W, B])
+        a = assemble(clean, [], cls_clean)
+        b = assemble(anom, [], cls_anom)
+        self.assertEqual(a.total_wagons, b.total_wagons)
+        self.assertEqual([w.global_id for w in a.wagons],
+                         [w.global_id for w in b.wagons])
+        self.assertEqual([w.start_frame_master for w in a.wagons],
+                         [w.start_frame_master for w in b.wagons])
 
     def test_unknown_inside_the_window_is_counted_and_reported(self):
         """An unlabelled vehicle between two wagons is physically a wagon."""
@@ -208,10 +241,11 @@ class TestWagonWindow(unittest.TestCase):
         for labels in ([E, W, B], [E, E, W, W, W, B], [W], [E, W, E, W, B],
                        [U, W, U], [E, B]):
             win = ts.get_master_wagon_window(self._segments(labels), verbose=False)
+            # Interior anomalies are part of wagon_units now, so only
+            # leading/trailing are outside the count.
             total = (win.master_wagon_count
                      + len(win.leading_non_wagon_objects)
-                     + len(win.trailing_non_wagon_objects)
-                     + len(win.interior_non_wagon_objects))
+                     + len(win.trailing_non_wagon_objects))
             self.assertEqual(total, len(labels), f"labels={labels}")
 
     def test_engine_and_brakevan_metadata_is_preserved(self):
