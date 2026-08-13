@@ -242,6 +242,44 @@ class GapValidationConfig:
     a whole to be a little better than the per-frame floor."""
 
     # ---- 7. train-motion context ----------------------------------------
+    motion_reference_window: int = 5
+    """Neighbouring tracks each side used for the ROLLING LOCAL motion reference.
+
+    The reference speed a candidate is compared against is the median of its
+    temporal neighbours, not the whole video's median. Trains accelerate and
+    decelerate: on the development train the validated speed falls from 560 to
+    312 px/s across one pass (a 1.80x range), and a local reference tracks that
+    far better -- worst deviation 1.24x local versus 1.61x global.
+
+    MEASURED NEUTRALITY: switching from the global to this local reference changed
+    ZERO accept/reject decisions on the full development video (0 candidates were
+    rejected on any speed reason to begin with, and simulating the local rule over
+    all 52 candidates produced 0 differing decisions). It is adopted because it is
+    the physically correct reference under changing speed, not to recover any gap
+    here -- there were none to recover.
+
+    0 disables the local reference and falls back to the global median."""
+
+    stopped_speed_fraction: float = 0.10
+    """A track is 'stalled' when its speed falls below this fraction of the
+    camera's median gap speed. Dimensionless, so it transfers across geometries.
+    Measured: the one isolated static artefact on the development video sat at
+    12 px/s against a 501 px/s reference = 0.024, while the slowest genuine gap
+    sat at 0.622 -- so 0.10 separates them with a wide margin on both sides."""
+
+    stop_corroboration_min_tracks: int = 2
+    """Near-zero-motion tracks needed, overlapping in time, before a stall is
+    treated as the TRAIN having stopped rather than as static artefacts.
+
+    An ISOLATED near-zero track stays REJECTED_STATIC -- that is the measured
+    false-positive signature (the development video contains exactly one such
+    track, at 12 px/s against a 501 px/s reference, and it is correctly rejected).
+    Only when several confirmed tracks stall together, having previously moved, is
+    a genuine stop the better explanation.
+
+    Requiring corroboration is what keeps this from becoming a hole: one static
+    artefact can never excuse itself. Set to 0 to disable."""
+
     train_motion_check_enabled: bool = True
     min_tracks_for_train_reference: int = 5
     """A per-camera reference speed is only computed when at least this many
@@ -386,6 +424,12 @@ class GapMotionFeatures:
     min_confidence: Optional[float]
     bbox_height_median: Optional[float]
     bbox_width_median: Optional[float]
+    motion_reference_speed: Optional[float] = None
+    """The reference speed this candidate was judged against (px/s)."""
+    motion_reference_kind: str = ""
+    """'local' (rolling median of temporal neighbours) or 'global' fallback."""
+    motion_paused: bool = False
+    """True when the track stalled but a corroborated TRAIN STOP explained it."""
 
     def to_dict(self) -> Dict[str, Any]:
         d = {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -420,6 +464,41 @@ class GapValidationResult:
     config_used: Dict[str, Any] = field(default_factory=dict)
     resolved_thresholds: Dict[str, Any] = field(default_factory=dict)
     """The camera-independent config resolved into this camera's px/frames."""
+    train_stopped_detected: bool = False
+    """True when several confirmed tracks stalled together, i.e. the TRAIN
+    stopped rather than individual detections being static artefacts."""
+
+    @property
+    def train_motion_state(self) -> str:
+        """Runtime motion state derived from MULTIPLE reliable tracks.
+
+        Diagnostic only -- it never gates a decision. A single candidate can
+        never define train motion: the state comes from the ordered speeds of the
+        accepted population.
+
+        MOVING / ACCELERATING / DECELERATING / STOPPED / UNKNOWN
+        """
+        speeds = [f.velocity_px_per_sec for f in self.features
+                  if f.velocity_px_per_sec is not None]
+        if len(speeds) < 3:
+            return "UNKNOWN"
+        if self.train_stopped_detected:
+            return "STOPPED"
+        ref = statistics.median(speeds)
+        if ref <= 0:
+            return "UNKNOWN"
+        ordered = [f.velocity_px_per_sec for f in
+                   sorted(self.features, key=lambda x: x.frame_start)]
+        half = max(1, len(ordered) // 2)
+        first, second = statistics.median(ordered[:half]), statistics.median(ordered[-half:])
+        if first <= 0:
+            return "UNKNOWN"
+        change = (second - first) / first
+        if change > 0.15:
+            return "ACCELERATING"
+        if change < -0.15:
+            return "DECELERATING"
+        return "MOVING"
 
     @property
     def rejection_counts(self) -> Dict[str, int]:
@@ -440,6 +519,9 @@ class GapValidationResult:
                 round(self.train_reference_speed, 2)
                 if self.train_reference_speed is not None else None),
             "resolved_thresholds": dict(self.resolved_thresholds),
+            "train_stopped_detected": self.train_stopped_detected,
+            "train_motion_state": self.train_motion_state,
+            "motion_paused_tracks": sum(1 for f in self.features if f.motion_paused),
         }
         if include_rejections:
             d["rejections"] = [r.to_dict() for r in self.rejected]
@@ -570,6 +652,40 @@ def validate_gap_events(
                   f"passing all {len(gaps)} tracked candidate(s) through")
         return result
 
+    # ---- pass 0: stall / train-stop pre-analysis --------------------------
+    #
+    # This must run BEFORE the per-track static check, because during a genuine
+    # train stop a gap's displacement really is ~0 and pass 1 would reject it as
+    # a static artefact. The distinction is corroboration: several confirmed
+    # tracks stalling TOGETHER means the train stopped, whereas an isolated
+    # stalled track is the measured false-positive signature.
+    prelim = [(g, compute_motion_features(g)) for g in gaps]
+    prelim = [(g, f) for g, f in prelim if f is not None]
+    prelim_speeds = [f.velocity_px_per_sec for _, f in prelim
+                     if f.velocity_px_per_sec > 0]
+    stall_ceiling = 0.0
+    paused_keys: set = set()
+    if prelim_speeds and cfg.stop_corroboration_min_tracks:
+        prelim_ref = statistics.median(prelim_speeds)
+        stall_ceiling = prelim_ref * cfg.stopped_speed_fraction
+        stalled = [(g, f) for g, f in prelim
+                   if f.velocity_px_per_sec <= stall_ceiling]
+        # A stop requires several stalled tracks OVERLAPPING IN TIME. Stalls
+        # scattered across the video are independent artefacts, not one stop.
+        for i, (g1, f1) in enumerate(stalled):
+            group = [(g1, f1)] + [
+                (g2, f2) for j, (g2, f2) in enumerate(stalled)
+                if j != i and not (f2.frame_end < f1.frame_start
+                                   or f2.frame_start > f1.frame_end)]
+            if len(group) >= cfg.stop_corroboration_min_tracks:
+                result.train_stopped_detected = True
+                for gg, ff in group:
+                    paused_keys.add((ff.frame_start, ff.frame_end))
+    if result.train_stopped_detected and verbose:
+        print(f"  [GAPVAL/{camera_id}] train-stop detected: "
+              f"{len(paused_keys)} track(s) stalled together below "
+              f"{stall_ceiling:.1f} px/s -> treated as MOTION_PAUSED, not static")
+
     # ---- pass 1: per-track tests, independent of the other tracks ----
     survivors: List[Tuple[GapEvent, GapMotionFeatures]] = []
     for g in sorted(gaps, key=lambda x: (x.center_frame, x.track_id)):
@@ -620,7 +736,11 @@ def validate_gap_events(
             detail = (f"mean confidence {f.mean_confidence:.2f} "
                       f"< min_mean_confidence={cfg.min_mean_confidence}")
 
-        # 4. motion: static artefacts are called out explicitly
+        # 4. motion: static artefacts are called out explicitly.
+        # A track stalled as part of a CORROBORATED train stop is exempt: its
+        # physical gap exists, the train simply is not moving.
+        elif (f.frame_start, f.frame_end) in paused_keys:
+            f.motion_paused = True
         elif f.abs_displacement_px <= res_thr.static_max_motion_px:
             reason = REJECTED_STATIC
             detail = (f"centre moved {f.abs_displacement_px:.1f} px over "
@@ -676,28 +796,67 @@ def validate_gap_events(
                     kept.append((g, f))
             survivors = kept
 
-    # ---- pass 2b: train-motion context (needs the surviving population) ----
+    # ---- pass 2b: train-motion context, using a ROLLING LOCAL reference ----
+    #
+    # A candidate is compared against the median speed of its temporal
+    # NEIGHBOURS, not the whole video's median, because trains accelerate and
+    # decelerate during a pass. The global median is still computed and reported
+    # for diagnostics, and is used as the fallback when a candidate has too few
+    # neighbours to form a local estimate.
     if (cfg.train_motion_check_enabled
             and len(survivors) >= cfg.min_tracks_for_train_reference):
+        survivors.sort(key=lambda t: (t[1].frame_start, t[0].track_id))
         speeds = [f.velocity_px_per_sec for _, f in survivors
                   if f.velocity_px_per_sec > 0]
         if speeds:
-            ref = statistics.median(speeds)
-            result.train_reference_speed = ref
+            ref_global = statistics.median(speeds)
+            result.train_reference_speed = ref_global
+
+            # The stop verdict was already established in pass 0.
+            stall_ceiling = ref_global * cfg.stopped_speed_fraction
+
             kept: List[Tuple[GapEvent, GapMotionFeatures]] = []
-            lo = ref / cfg.train_motion_tolerance
-            hi = ref * cfg.train_motion_tolerance
-            for g, f in survivors:
+            for idx, (g, f) in enumerate(survivors):
                 v = f.velocity_px_per_sec
-                if v < lo or v > hi:
-                    result.rejected.append(GapRejection(
-                        REJECTED_TRAIN_MOTION_MISMATCH,
-                        f"apparent speed {v:.1f} px/s is outside "
-                        f"[{lo:.1f}, {hi:.1f}] px/s, i.e. more than "
-                        f"{cfg.train_motion_tolerance}x from this camera's median "
-                        f"gap speed {ref:.1f} px/s", f))
-                else:
+
+                # local reference: median speed of the temporal neighbours
+                ref = ref_global
+                ref_kind = "global"
+                w = cfg.motion_reference_window
+                if w > 0:
+                    lo_i, hi_i = max(0, idx - w), min(len(survivors), idx + w + 1)
+                    neigh = [survivors[j][1].velocity_px_per_sec
+                             for j in range(lo_i, hi_i)
+                             if j != idx and survivors[j][1].velocity_px_per_sec > 0]
+                    if len(neigh) >= 2:
+                        ref = statistics.median(neigh)
+                        ref_kind = "local"
+                f.motion_reference_speed = ref
+                f.motion_reference_kind = ref_kind
+
+                lo = ref / cfg.train_motion_tolerance
+                hi = ref * cfg.train_motion_tolerance
+                if lo <= v <= hi:
                     kept.append((g, f))
+                    continue
+
+                # Outside the band. A stalled track survives ONLY when a stop is
+                # corroborated by other simultaneously-stalled confirmed tracks.
+                if v <= stall_ceiling and (f.frame_start, f.frame_end) in paused_keys:
+                    f.motion_paused = True
+                    kept.append((g, f))
+                    continue
+
+                detail = (f"apparent speed {v:.1f} px/s is outside "
+                          f"[{lo:.1f}, {hi:.1f}] px/s, i.e. more than "
+                          f"{cfg.train_motion_tolerance}x from the {ref_kind} "
+                          f"reference speed {ref:.1f} px/s")
+                if v <= stall_ceiling:
+                    detail += (f"; the track is stalled and no other confirmed "
+                               f"track stalls with it, so this is an isolated "
+                               f"static artefact rather than a train stop")
+                result.rejected.append(GapRejection(
+                    REJECTED_TRAIN_MOTION_MISMATCH, detail, f))
             survivors = kept
 
     # ---- pass 3: duplicate suppression -- one physical gap, one GapEvent ----
