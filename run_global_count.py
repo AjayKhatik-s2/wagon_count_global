@@ -323,6 +323,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--aws-region", default="ap-south-1",
                    help="Region used to build artifact https URLs (default: "
                         "ap-south-1)")
+    p.add_argument("--report-logo", default=None,
+                   help="Logo image placed top-left on the combined report "
+                        "(optional; omitted if the file is absent)")
+    p.add_argument("--emit-global-fields", action="store_true",
+                   help="Include the additive global-identity fields "
+                        "(global_wagon_id, inspection_status, ...) in the "
+                        "dashboard's inspection_data.json. OFF by default so "
+                        "that file is byte-for-byte the legacy contract. The "
+                        "fields are always written to the sibling "
+                        "inspection_data.internal.json regardless, so nothing "
+                        "internal loses its provenance.")
     p.add_argument("--annotated-videos", action="store_true",
                    help="Also write the legacy annotated videos (damage/door "
                         "boxes drawn from the PERSISTED detections -- no second "
@@ -1254,6 +1265,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     # Opt-in, and only with somewhere to put them.
                     upload_to_s3=bool(args.upload_artifacts
                                       and args.artifact_bucket),
+                    emit_global_fields=bool(args.emit_global_fields),
                     build_annotated_video=bool(args.annotated_videos)),
                 load_status_by_wagon=load_by_wagon,
                 s3_client=s3_client, verbose=verbose)
@@ -1302,6 +1314,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     load_status_by_wagon=load_by_wagon,
                     batch_key=os.path.basename(os.path.abspath(args.output)),
                     build_videos=bool(args.annotated_videos),
+                    logo_path=args.report_logo,
                     verbose=verbose)
             else:
                 legacy_paths = {}

@@ -78,7 +78,15 @@ __all__ = [
     "LocalArtifactSink", "EXPECTED_SIDE_CLASSES", "EXPECTED_TOP_CLASSES",
     "STATUS_INSPECTED", "STATUS_NO_DETECTION", "STATUS_NOT_VISIBLE",
     "STATUS_UNRESOLVED", "STATUS_AMBIGUOUS", "apply_to_unified",
+    "dashboard_payload", "INTERNAL_JSON_NAME", "GLOBAL_TOP_LEVEL_FIELDS",
+    "GLOBAL_SEGMENT_FIELDS",
 ]
+
+INTERNAL_JSON_NAME = "inspection_data.internal.json"
+"""Sibling of ``inspection_data.json`` carrying the global-identity fields.
+
+The dashboard file must match the legacy contract exactly, so the provenance
+that the renderers and the audit trail need lives here instead. Never uploaded."""
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +211,36 @@ class LegacyInspectionConfig:
 
     version: str = "v4"
     """Legacy ``version`` field, unchanged so the dashboard's parser matches."""
+
+    emit_global_fields: bool = False
+    """Whether ``inspection_data.json`` carries the additive global-identity
+    fields. **OFF by default: the dashboard file is byte-for-byte the legacy
+    contract**, with no key the old pipeline did not emit.
+
+    Nothing is lost by this. The fields (``global_wagon_id``,
+    ``inspection_status``, ``counting_source``, ``global_wagon_count``,
+    ``ocr_enabled``, ``camera_role``) are always written to the sibling
+    ``inspection_data.internal.json``, which is what the renderers and the audit
+    trail read. Two files, one payload: the dashboard sees exactly what the old
+    system sent it, and nothing internal has to go without provenance.
+
+    Set True only if the dashboard has been extended to accept the extras."""
+
+    station_name: str = "HAZARIBAGH"
+
+    raw_video_bucket: str = "biro-wagon-raw-video-copy"
+    trimmed_video_bucket: str = "biro-wagon-pre-processed-video-copy"
+    detected_video_bucket: str = "biro-wagon-processed-video-copy"
+    report_bucket: str = "biro-wagon-report-biro-copy"
+    """RECOVERED from the legacy camera YAMLs. Used to rebuild the four URL
+    fields in the legacy shape. An empty bucket leaves its URL ``null``, which
+    is what the old pipeline emitted when the upload had not happened."""
+
+    video_urls_by_camera: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    """Explicit per-camera overrides:
+    ``{camera_id: {pdf_report_url, trimmed_video_url, detected_video_url,
+    raw_video_urls}}``. Any key present here wins over the derived URL, so a
+    caller that already knows the real upload locations can supply them."""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -513,6 +551,81 @@ def _direction_for(state: Any, profile: gb.CameraProfile) -> str:
     return profile.loaded_direction
 
 
+def _video_urls(cfg: LegacyInspectionConfig, profile: gb.CameraProfile,
+                raw_video_name: str,
+                upload_timestamp: datetime) -> Dict[str, Any]:
+    """Rebuild the legacy ``*_url`` fields.
+
+    RECOVERED from real legacy ``inspection_data.json`` payloads, which name
+    every artifact after the raw clip:
+
+        pdf       {report}/{camera_folder}/{raw}_inspection_report.pdf
+        trimmed   {trimmed}/{camera_folder}/{raw}_train.mp4
+        detected  {detected}/{camera_folder}/{raw}_detected_video.mp4
+        raw       {raw_bucket}/{camera_folder}/{YYYY-MM-DD}/{raw}.mp4
+
+    ``raw_video_urls`` is a LIST because one train can span several raw clips;
+    only the clip this run was given is known here, so the list has one entry
+    unless the caller overrides it.
+
+    A bucket left empty yields ``None`` for its URL (and ``[]`` for the raw
+    list) rather than a fabricated link — the same thing the old pipeline
+    emitted before an upload had happened. Explicit overrides always win.
+    """
+    from .legacy.url_utils import s3_object_url
+
+    def url(bucket: str, key: str) -> Optional[str]:
+        if not bucket:
+            return None
+        return s3_object_url(bucket, key, cfg.region)
+
+    folder = profile.folder
+    day = upload_timestamp.strftime("%Y-%m-%d")
+    derived: Dict[str, Any] = {
+        "pdf_report_url": url(
+            cfg.report_bucket, f"{folder}/{raw_video_name}_inspection_report.pdf"),
+        "trimmed_video_url": url(
+            cfg.trimmed_video_bucket, f"{folder}/{raw_video_name}_train.mp4"),
+        "detected_video_url": url(
+            cfg.detected_video_bucket,
+            f"{folder}/{raw_video_name}_detected_video.mp4"),
+        "raw_video_urls": [
+            u for u in [url(cfg.raw_video_bucket,
+                            f"{folder}/{day}/{raw_video_name}.mp4")] if u
+        ],
+    }
+    derived.update(cfg.video_urls_by_camera.get(profile.camera_id, {}) or {})
+    return derived
+
+
+# The additive global-identity fields. Listed once, here, so the dashboard
+# payload and the schema tests cannot disagree about what "additive" means.
+GLOBAL_TOP_LEVEL_FIELDS = ("counting_source", "global_wagon_count",
+                           "ocr_enabled", "camera_role")
+GLOBAL_SEGMENT_FIELDS = ("global_wagon_id", "inspection_status")
+
+
+def dashboard_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip the additive fields, leaving the exact legacy contract.
+
+    Returns a deep copy: the caller keeps the annotated payload for the
+    renderers and the audit trail, and the dashboard gets a document with no key
+    the old pipeline did not emit.
+    """
+    import copy
+
+    out = copy.deepcopy(payload)
+    data = out.get("inspection_data", {})
+    for key in GLOBAL_TOP_LEVEL_FIELDS:
+        data.pop(key, None)
+    for seg in data.get("wagon_segments") or []:
+        for key in GLOBAL_SEGMENT_FIELDS:
+            seg.pop(key, None)
+    for pf in data.get("problem_frames") or []:
+        pf.pop("global_wagon_id", None)
+    return out
+
+
 def _evidence_status(camera_status: str, has_window: bool,
                      scanned: bool, found: bool) -> str:
     if camera_status == "UNRESOLVED":
@@ -636,11 +749,17 @@ def _run_camera(
     res.problem_frames = len(problem_frames)
 
     # ---- JSON: the LEGACY builder, unchanged -------------------------------
+    raw_video_name = _raw_video_name(tracks_by_camera, camera_id)
+    urls = _video_urls(cfg, profile, raw_video_name, upload_timestamp)
     payload = build_inspection_json(
         camera_folder=profile.folder,
-        raw_video_name=_raw_video_name(tracks_by_camera, camera_id),
+        raw_video_name=raw_video_name,
         upload_timestamp=upload_timestamp,
         direction=_direction_for(state, profile),
+        pdf_report_url=urls["pdf_report_url"],
+        trimmed_video_url=urls["trimmed_video_url"],
+        detected_video_url=urls["detected_video_url"],
+        raw_video_urls=urls["raw_video_urls"],
         flavour=profile.flavour,
         segment_summary_df=full_df,
         damage_results_df=damage_df,
@@ -677,11 +796,22 @@ def _run_camera(
     res.payload = payload
     res.wagons_in_json = len(payload["inspection_data"].get("wagon_segments", []))
 
+    # TWO FILES, ONE PAYLOAD.
+    #   inspection_data.json            the dashboard's document -- exactly the
+    #                                   legacy contract, no key the old pipeline
+    #                                   did not emit (unless emit_global_fields)
+    #   inspection_data.internal.json   the same payload WITH the global-identity
+    #                                   fields, for the renderers and the audit
+    #                                   trail
+    # The dashboard cannot tell the backends apart; nothing internal loses its
+    # provenance. Only the first is ever uploaded.
+    dashboard = payload if cfg.emit_global_fields else dashboard_payload(payload)
     json_path = os.path.join(work_dir, "inspection_data.json")
-    _write_json(json_path, payload)
+    _write_json(json_path, dashboard)
+    _write_json(os.path.join(work_dir, INTERNAL_JSON_NAME), payload)
     res.json_path = json_path
     if cfg.upload_to_s3 and cfg.artifact_bucket and s3_client is not None:
-        publisher.upload_inspection_json(timestamp_str, payload, work_dir)
+        publisher.upload_inspection_json(timestamp_str, dashboard, work_dir)
 
     # ---- persisted inputs for the renderers (NO model runs downstream) -----
     _persist_frames(work_dir, full_df, damage_df, problem_frames_df,

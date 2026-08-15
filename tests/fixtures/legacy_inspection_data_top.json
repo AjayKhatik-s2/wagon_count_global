@@ -1,0 +1,107 @@
+{
+  "camera_id": "CCTV_HZBN_DHN_5_RIGHT_TOP",
+  "version": "v4",
+  "inspection_data": {
+    "raw_video_name": "camera_CCTV_HZBN_DHN_5_RIGHT_TOP_20260813_183209",
+    "identified_by": "model-v3",
+    "upload_timestamp": "2026-08-13T18:32:09",
+    "upload_timestamp_readable": "13-08-2026 18:32:09 IST",
+    "direction": "right-to-left",
+    "rake_status": "Empty",
+    "pdf_report_url": "https://biro-wagon-report-biro-copy.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/camera_CCTV_HZBN_DHN_5_RIGHT_TOP_20260813_183209_inspection_report.pdf",
+    "trimmed_video_url": "https://biro-wagon-pre-processed-video-copy.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/camera_CCTV_HZBN_DHN_5_RIGHT_TOP_20260813_183209_train.mp4",
+    "detected_video_url": "https://biro-wagon-processed-video-copy.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/camera_CCTV_HZBN_DHN_5_RIGHT_TOP_20260813_183209_detected_video.mp4",
+    "raw_video_urls": [
+      "https://biro-wagon-raw-video-copy.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/2026-08-13/camera_CCTV_HZBN_DHN_5_RIGHT_TOP_20260813_183209.mp4"
+    ],
+    "total_wagons": 9,
+    "wagons_loaded": 0,
+    "wagons_empty": 9,
+    "damaged_wagons": 0,
+    "probable_damage_wagons": 0,
+    "floor_dmg_wagons": 0,
+    "inner_wall_dmg_wagons": 0,
+    "floor_dmg_probable_wagons": 0,
+    "num_engines": 0,
+    "num_brakevans": 0,
+    "total_loco_frames": 0,
+    "total_problem_frames": 0,
+    "problem_frames_by_type": {
+      "floor_dmg": 0,
+      "inner_wall_dmg": 0,
+      "floor_dmg_probable": 0
+    },
+    "wagon_number_results": {},
+    "loco_number_results": {},
+    "segment_type_map": {
+      "1": { "type": "wagon_empty", "number": 1, "wagon_count": 1 },
+      "2": { "type": "wagon_empty", "number": 2, "wagon_count": 2 },
+      "3": { "type": "wagon_empty", "number": 3, "wagon_count": 3 },
+      "4": { "type": "wagon_empty", "number": 4, "wagon_count": 4 },
+      "5": { "type": "wagon_empty", "number": 5, "wagon_count": 5 },
+      "6": { "type": "wagon_empty", "number": 6, "wagon_count": 6 },
+      "7": { "type": "wagon_empty", "number": 7, "wagon_count": 7 },
+      "8": { "type": "wagon_empty", "number": 8, "wagon_count": 8 },
+      "9": { "type": "wagon_empty", "number": 9, "wagon_count": 9 }
+    },
+    "wagon_segments": [
+      {
+        "segment_id": 1,
+        "segment_type": "wagon_empty",
+        "wagon_count": 1,
+        "load_status": "empty",
+        "load_condition": null,
+        "damage_detected": false,
+        "probable_damage_detected": false,
+        "floor_dmg_detected": false,
+        "inner_wall_dmg_detected": false,
+        "floor_dmg_probable_detected": false,
+        "wagon_frames": [
+          {
+            "position": "start",
+            "s3_url": "https://test-inspection-artifacts-sarva.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/2026-08-13_18-32-09/wagon_frames/wagon_empty_001_frame_001086_start.jpg"
+          },
+          {
+            "position": "mid1",
+            "s3_url": "https://test-inspection-artifacts-sarva.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/2026-08-13_18-32-09/wagon_frames/wagon_empty_001_frame_001436_mid1.jpg"
+          },
+          {
+            "position": "end",
+            "s3_url": "https://test-inspection-artifacts-sarva.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/2026-08-13_18-32-09/wagon_frames/wagon_empty_001_frame_001729_end.jpg"
+          }
+        ],
+        "is_valid_wagon_id": false
+      },
+      {
+        "segment_id": 2,
+        "segment_type": "wagon_empty",
+        "wagon_count": 2,
+        "load_status": "empty",
+        "load_condition": null,
+        "damage_detected": false,
+        "probable_damage_detected": false,
+        "floor_dmg_detected": false,
+        "inner_wall_dmg_detected": false,
+        "floor_dmg_probable_detected": false,
+        "wagon_frames": [
+          {
+            "position": "start",
+            "s3_url": "https://test-inspection-artifacts-sarva.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/2026-08-13_18-32-09/wagon_frames/wagon_empty_002_frame_001978_start.jpg"
+          },
+          {
+            "position": "mid1",
+            "s3_url": "https://test-inspection-artifacts-sarva.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/2026-08-13_18-32-09/wagon_frames/wagon_empty_002_frame_001995_mid1.jpg"
+          },
+          {
+            "position": "end",
+            "s3_url": "https://test-inspection-artifacts-sarva.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_5_RIGHT_TOP/2026-08-13_18-32-09/wagon_frames/wagon_empty_002_frame_002009_end.jpg"
+          }
+        ],
+        "is_valid_wagon_id": false
+      }
+    ],
+    "loco_frames": [],
+    "problem_frames": [],
+    "damage_model_active": true
+  }
+}

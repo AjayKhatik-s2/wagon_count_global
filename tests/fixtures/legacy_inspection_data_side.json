@@ -1,0 +1,40 @@
+{
+  "camera_id": "CCTV_HZBN_DHN_1_LEFT_UP",
+  "version": "v4",
+  "inspection_data": {
+    "raw_video_name": "camera_CCTV_HZBN_DHN_1_LEFT_UP_20260815_183433",
+    "identified_by": "model-v3",
+    "upload_timestamp": "2026-08-15T18:34:33",
+    "upload_timestamp_readable": "15-08-2026 18:34:33 IST",
+    "direction": "right-to-left",
+    "rake_status": "Empty",
+    "pdf_report_url": "https://biro-wagon-report-biro-copy.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_1_LEFT_UP/camera_CCTV_HZBN_DHN_1_LEFT_UP_20260815_183433_inspection_report.pdf",
+    "trimmed_video_url": "https://biro-wagon-pre-processed-video-copy.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_1_LEFT_UP/camera_CCTV_HZBN_DHN_1_LEFT_UP_20260815_183433_train.mp4",
+    "detected_video_url": "https://biro-wagon-processed-video-copy.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_1_LEFT_UP/camera_CCTV_HZBN_DHN_1_LEFT_UP_20260815_183433_detected_video.mp4",
+    "raw_video_urls": [
+      "https://biro-wagon-raw-video-copy.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_1_LEFT_UP/2026-08-15/camera_CCTV_HZBN_DHN_1_LEFT_UP_20260815_183433.mp4",
+      "https://biro-wagon-raw-video-copy.s3.ap-south-1.amazonaws.com/camera_CCTV_HZBN_DHN_1_LEFT_UP/2026-08-15/camera_CCTV_HZBN_DHN_1_LEFT_UP_20260815_183934.mp4"
+    ],
+    "total_wagons": 0,
+    "doors_open": 0,
+    "doors_partially_closed": 0,
+    "doors_closed": 0,
+    "damaged_wagons": 0,
+    "num_engines": 0,
+    "total_loco_frames": 0,
+    "total_problem_frames": 0,
+    "problem_frames_by_type": {
+      "damage": 0,
+      "open_door": 0,
+      "closed_door": 0,
+      "partially_closed": 0
+    },
+    "wagon_number_results": {},
+    "loco_number_results": {},
+    "segment_type_map": {},
+    "wagon_segments": [],
+    "loco_frames": [],
+    "problem_frames": [],
+    "damage_model_active": true
+  }
+}

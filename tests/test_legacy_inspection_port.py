@@ -1598,5 +1598,624 @@ class TestCollectionConfig(unittest.TestCase):
         self.assertTrue(os.path.isdir(legacy))
 
 
+# ---------------------------------------------------------------------------
+# 20. GOLDEN SCHEMA -- real payloads from the OLD pipeline
+# ---------------------------------------------------------------------------
+
+FIXTURES = os.path.join(ROOT, "tests", "fixtures")
+
+
+def golden(name):
+    with open(os.path.join(FIXTURES, name), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def walk_shape(node, path="", out=None):
+    """Every leaf path and its JSON type. `null` is recorded as its own type
+    because the legacy schema uses it as a real value (`load_condition`).
+
+    Id-keyed maps (`segment_type_map`, `wagon_number_results`) collapse to a
+    single `*` key, so this compares SHAPE and not how many wagons the fixture
+    happened to contain -- a 9-wagon golden payload and a 3-wagon run have the
+    same schema.
+    """
+    out = {} if out is None else out
+    if isinstance(node, dict):
+        id_keyed = bool(node) and all(str(k).isdigit() for k in node)
+        for key, value in node.items():
+            step = "*" if id_keyed else key
+            walk_shape(value, f"{path}.{step}" if path else str(step), out)
+    elif isinstance(node, list):
+        out[path] = "list"
+        if node:
+            # The element's own paths hang off "[]" so the container marker
+            # above is not overwritten by its first element's type.
+            walk_shape(node[0], path + "[]", out)
+    else:
+        out[path] = ("null" if node is None
+                     else "bool" if isinstance(node, bool)
+                     else "int" if isinstance(node, int)
+                     else "float" if isinstance(node, float) else "str")
+    return out
+
+
+class TestGoldenSchema(TempCase):
+    """The emitted payload must be indistinguishable from the old pipeline's.
+
+    Both fixtures are REAL ``inspection_data.json`` documents produced by the
+    old system -- one side camera, one top camera. They are the contract: if the
+    dashboard accepted these, it must accept ours.
+    """
+
+    def _dashboard(self, state, camera_id, **kw):
+        return li.dashboard_payload(
+            build_json_for(state, camera_id, self.cache, **kw))
+
+    # ---- key sets ----------------------------------------------------
+
+    def test_side_keys_match_the_golden_payload_exactly(self):
+        ref = golden("legacy_inspection_data_side.json")["inspection_data"]
+        state = roster(3)
+        seed_cache(self.cache, state, [C.CAMERA_LEFT_UP])
+        got = self._dashboard(state, C.CAMERA_LEFT_UP)["inspection_data"]
+        self.assertEqual(list(got), list(ref),
+                         "side payload keys/order drifted from the old pipeline")
+
+    def test_top_keys_match_the_golden_payload_exactly(self):
+        ref = golden("legacy_inspection_data_top.json")["inspection_data"]
+        state = roster(3)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP_TOP])
+        got = self._dashboard(state, C.CAMERA_RIGHT_UP_TOP)["inspection_data"]
+        self.assertEqual(list(got), list(ref),
+                         "top payload keys/order drifted from the old pipeline")
+
+    def test_envelope_matches(self):
+        for name, camera_id in (("legacy_inspection_data_side.json", C.CAMERA_LEFT_UP),
+                                ("legacy_inspection_data_top.json", C.CAMERA_RIGHT_UP_TOP)):
+            ref = golden(name)
+            state = roster(2)
+            seed_cache(self.cache, state, [camera_id])
+            got = self._dashboard(state, camera_id)
+            self.assertEqual(list(got), list(ref))
+            self.assertEqual(got["version"], ref["version"])
+            self.assertEqual(got["camera_id"], ref["camera_id"])
+
+    # ---- wagon_segments ------------------------------------------------
+
+    def test_top_wagon_segment_matches_the_golden_shape(self):
+        ref = golden("legacy_inspection_data_top.json")
+        ref_seg = ref["inspection_data"]["wagon_segments"][0]
+        state = roster(3)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP_TOP])
+        seg = self._dashboard(
+            state, C.CAMERA_RIGHT_UP_TOP)["inspection_data"]["wagon_segments"][0]
+        self.assertEqual(list(seg), list(ref_seg))
+        for key, want in ref_seg.items():
+            if key in ("wagon_frames", "segment_id", "wagon_count"):
+                continue
+            self.assertEqual(type(seg[key]), type(want), key)
+
+    def test_wagon_frames_entry_shape(self):
+        ref = golden("legacy_inspection_data_top.json")
+        ref_frame = ref["inspection_data"]["wagon_segments"][0]["wagon_frames"][0]
+        self.assertEqual(sorted(ref_frame), ["position", "s3_url"])
+        state = roster(2)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP_TOP], frames=80)
+        payload = _publish_and_build(state, C.CAMERA_RIGHT_UP_TOP, self.cache,
+                                     self.tmp)
+        frames = payload["inspection_data"]["wagon_segments"][0]["wagon_frames"]
+        self.assertTrue(frames, "evidence frames must be emitted")
+        for frame in frames:
+            self.assertEqual(sorted(frame), ["position", "s3_url"])
+        self.assertEqual([f["position"] for f in frames],
+                         ["start", "mid1", "end"])
+
+    # ---- types ---------------------------------------------------------
+
+    def test_leaf_types_match_the_golden_payload(self):
+        for name, camera_id in (("legacy_inspection_data_side.json", C.CAMERA_LEFT_UP),
+                                ("legacy_inspection_data_top.json", C.CAMERA_RIGHT_UP_TOP)):
+            ref = golden(name)
+            state = roster(3)
+            seed_cache(self.cache, state, [camera_id])
+            got = self._dashboard(state, camera_id)
+            ref_shape = walk_shape(ref)
+            got_shape = walk_shape(got)
+            for path, want in ref_shape.items():
+                if path not in got_shape:
+                    # Only ELEMENT paths may be absent, and only because the
+                    # corresponding list is empty in this run (no problem
+                    # frames, no configured buckets). Container and scalar
+                    # paths must always be present -- those are the schema.
+                    self.assertIn("[]", path, f"missing leaf {path}")
+                    continue
+                got_type = got_shape[path]
+                if want == "null" or got_type == "null":
+                    continue          # nullable in the legacy schema
+                self.assertEqual(got_type, want,
+                                 f"{name}: {path} is {got_type}, golden has {want}")
+
+    # ---- the url block -------------------------------------------------
+
+    def test_url_fields_follow_the_golden_naming(self):
+        from datetime import datetime as _dt
+        ref = golden("legacy_inspection_data_side.json")["inspection_data"]
+        raw = ref["raw_video_name"]
+        urls = li._video_urls(
+            li.LegacyInspectionConfig(),
+            gb.camera_profile(C.CAMERA_LEFT_UP), raw,
+            _dt(2026, 8, 15, 18, 34, 33))
+        self.assertEqual(urls["pdf_report_url"], ref["pdf_report_url"])
+        self.assertEqual(urls["trimmed_video_url"], ref["trimmed_video_url"])
+        self.assertEqual(urls["detected_video_url"], ref["detected_video_url"])
+        self.assertEqual(urls["raw_video_urls"][0], ref["raw_video_urls"][0])
+
+    def test_absent_bucket_yields_null_not_a_fabricated_url(self):
+        from datetime import datetime as _dt
+        cfg = li.LegacyInspectionConfig(
+            raw_video_bucket="", trimmed_video_bucket="",
+            detected_video_bucket="", report_bucket="")
+        urls = li._video_urls(cfg, gb.camera_profile(C.CAMERA_LEFT_UP), "clip",
+                              _dt(2026, 1, 1))
+        self.assertIsNone(urls["pdf_report_url"])
+        self.assertEqual(urls["raw_video_urls"], [])
+
+    def test_explicit_urls_override_the_derived_ones(self):
+        from datetime import datetime as _dt
+        cfg = li.LegacyInspectionConfig(video_urls_by_camera={
+            C.CAMERA_LEFT_UP: {"pdf_report_url": "https://example/x.pdf",
+                               "raw_video_urls": ["https://example/a.mp4",
+                                                  "https://example/b.mp4"]}})
+        urls = li._video_urls(cfg, gb.camera_profile(C.CAMERA_LEFT_UP), "clip",
+                              _dt(2026, 1, 1))
+        self.assertEqual(urls["pdf_report_url"], "https://example/x.pdf")
+        self.assertEqual(len(urls["raw_video_urls"]), 2)
+        self.assertIn("biro-wagon-pre-processed", urls["trimmed_video_url"])
+
+    # ---- the additive fields are OFF by default ------------------------
+
+    def test_no_additive_field_reaches_the_dashboard_payload(self):
+        state = roster(4)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        for camera_id in C.ALL_CAMERAS:
+            data = self._dashboard(state, camera_id)["inspection_data"]
+            for key in li.GLOBAL_TOP_LEVEL_FIELDS:
+                self.assertNotIn(key, data, f"{camera_id}: {key} must not ship")
+            for seg in data["wagon_segments"]:
+                for key in li.GLOBAL_SEGMENT_FIELDS:
+                    self.assertNotIn(key, seg, f"{camera_id}: {key} must not ship")
+
+    def test_default_config_keeps_the_dashboard_file_legacy_exact(self):
+        self.assertFalse(li.LegacyInspectionConfig().emit_global_fields)
+
+    def test_the_internal_payload_keeps_the_global_identity(self):
+        """Stripping is for the wire, not for us -- provenance is not lost."""
+        state = roster(4)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP])
+        full = build_json_for(state, C.CAMERA_RIGHT_UP, self.cache)
+        self.assertEqual(full["inspection_data"]["global_wagon_count"], 4)
+        self.assertEqual(
+            [s["global_wagon_id"] for s in full["inspection_data"]["wagon_segments"]],
+            ["GW_1", "GW_2", "GW_3", "GW_4"])
+
+    def test_stripping_does_not_mutate_the_source_payload(self):
+        state = roster(3)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP])
+        full = build_json_for(state, C.CAMERA_RIGHT_UP, self.cache)
+        li.dashboard_payload(full)
+        self.assertIn("global_wagon_count", full["inspection_data"])
+        self.assertIn("global_wagon_id",
+                      full["inspection_data"]["wagon_segments"][0])
+
+    def test_problem_frame_global_id_is_stripped_too(self):
+        state = roster(5)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP])
+        entries = [{"wagon_id": 3, "wagon_count": 3, "segment_type": "wagon",
+                    "problem_type": "damage", "frame_number": 10,
+                    "filename": "f.jpg", "s3_key": "k", "s3_url": "u",
+                    "is_annotated": False, "annotated_image_url": None,
+                    "bounding_box": None}]
+        full = build_json_for(state, C.CAMERA_RIGHT_UP, self.cache,
+                              damage_rows=[side_damage_row(3, damage=True)],
+                              problem_entries=entries)
+        self.assertIn("global_wagon_id", full["inspection_data"]["problem_frames"][0])
+        dash = li.dashboard_payload(full)
+        pf = dash["inspection_data"]["problem_frames"][0]
+        self.assertNotIn("global_wagon_id", pf)
+        ref_keys = {"wagon_count", "segment_type", "segment_number",
+                    "problem_type", "frame_number", "filename", "s3_key",
+                    "s3_url", "is_annotated", "annotated_image_url",
+                    "bounding_box", "door_status", "door_close_detected",
+                    "door_partial_detected", "damage_detected"}
+        self.assertEqual(set(pf), ref_keys)
+
+    # ---- renderers still see the identity ------------------------------
+
+    def test_renderers_read_the_internal_file(self):
+        state = roster(4)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP])
+        out = os.path.join(self.tmp, "out")
+        work = os.path.join(out, gb.camera_profile(C.CAMERA_RIGHT_UP).legacy_name)
+        os.makedirs(work, exist_ok=True)
+        full = build_json_for(state, C.CAMERA_RIGHT_UP, self.cache)
+        li._write_json(os.path.join(work, "inspection_data.json"),
+                       li.dashboard_payload(full))
+        li._write_json(os.path.join(work, li.INTERNAL_JSON_NAME), full)
+
+        payloads = lr.load_camera_payloads(out)
+        self.assertIn("global_wagon_count",
+                      payloads[C.CAMERA_RIGHT_UP]["inspection_data"])
+        rows = lr.combined_wagon_rows(state, payloads)
+        self.assertEqual(len(rows), 4)
+
+    def test_renderers_survive_a_dashboard_only_directory(self):
+        state = roster(4)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP])
+        out = os.path.join(self.tmp, "out")
+        work = os.path.join(out, gb.camera_profile(C.CAMERA_RIGHT_UP).legacy_name)
+        os.makedirs(work, exist_ok=True)
+        li._write_json(os.path.join(work, "inspection_data.json"),
+                       li.dashboard_payload(
+                           build_json_for(state, C.CAMERA_RIGHT_UP, self.cache)))
+        rows = lr.combined_wagon_rows(state, lr.load_camera_payloads(out))
+        self.assertEqual(len(rows), 4, "the report must not shrink without the "
+                                       "internal file")
+
+
+# ---------------------------------------------------------------------------
+# 21. THE COMBINED WAGON EYE REPORT -- matched to the production document
+# ---------------------------------------------------------------------------
+
+class TestCombinedReport(TempCase):
+    """Structure, vocabulary and row set of the combined report.
+
+    The reference is the production `Rake_Inspection_Report` PDF: a banner,
+    VIDEO EVIDENCE / DETAILED REPORTS / INSPECTION SUMMARY on page 1, paged
+    WAGON INSPECTION DETAILS, then a Damaged Wagon Report with evidence panels.
+    """
+
+    def _band(self, start=100):
+        return {"band_id": 1, "start_frame": start, "end_frame": start + 9,
+                "frames": list(range(start, start + 10)), "confidences": [0.9],
+                "frame_count": 10, "avg_confidence": 0.9,
+                "detection_count": 10, "best_frame": start + 4,
+                "best_confidence": 0.9}
+
+    def _write_camera(self, state, camera_id, out, rows=None, load=None):
+        profile = gb.camera_profile(camera_id)
+        work = os.path.join(out, profile.legacy_name)
+        os.makedirs(work, exist_ok=True)
+        payload = build_json_for(state, camera_id, self.cache,
+                                 damage_rows=rows, load_status_by_wagon=load)
+        li._write_json(os.path.join(work, li.INTERNAL_JSON_NAME), payload)
+        li._write_json(os.path.join(work, "inspection_data.json"),
+                       li.dashboard_payload(payload))
+        pd.DataFrame(rows or []).to_csv(
+            os.path.join(work, "damage_results.csv"), index=False)
+        return work
+
+    # ---- DOOR 1 / DOOR 2 from bands ---------------------------------
+
+    def test_door_cell_vocabulary(self):
+        from inspection.combined_report import door_cell_text
+        self.assertEqual(door_cell_text([]), "NO DOOR DETECTED")
+        self.assertEqual(
+            door_cell_text([{"class": "closed_door", "start_frame": 1}]),
+            "DOOR 1 CLOSED")
+        self.assertEqual(
+            door_cell_text([{"class": "open_door", "start_frame": 1}]),
+            "DOOR 1 OPEN")
+        self.assertEqual(
+            door_cell_text([{"class": "partially_closed", "start_frame": 1}]),
+            "DOOR 1 PARTIAL CLOSED")
+        self.assertEqual(
+            door_cell_text([{"class": "closed_door", "start_frame": 1},
+                            {"class": "partially_closed", "start_frame": 9}]),
+            "DOOR 1 CLOSED / DOOR 2 PARTIAL CLOSED")
+
+    def test_not_visible_is_not_no_door(self):
+        from inspection.combined_report import door_cell_text
+        self.assertEqual(door_cell_text([], visible=False), "NOT VISIBLE")
+
+    def test_two_bands_become_two_doors(self):
+        """Bands are the door instances -- rebuilt from persisted state only."""
+        from inspection.combined_report import wagon_report_rows
+
+        state = roster(3)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        row = side_damage_row(2, door_status="partially_closed", partial=True)
+        row["closed_door_band_info"] = [self._band(10)]
+        row["partially_closed_band_info"] = [self._band(90)]
+        self._write_camera(state, C.CAMERA_LEFT_UP, out, [row])
+        for cam in (C.CAMERA_RIGHT_UP, C.CAMERA_RIGHT_UP_TOP, C.CAMERA_LEFT_UP_TOP):
+            self._write_camera(state, cam, out, [])
+        rows = wagon_report_rows(state, lr.load_camera_payloads(out), out)
+        by = {r["sr_no"]: r for r in rows}
+        self.assertEqual(by[2]["left_text"],
+                         "DOOR 1 CLOSED / DOOR 2 PARTIAL CLOSED")
+        self.assertEqual(by[1]["left_text"], "NO DOOR DETECTED")
+
+    # ---- row set is the global roster --------------------------------
+
+    def test_one_row_per_global_wagon(self):
+        from inspection.combined_report import wagon_report_rows
+        state = roster(57)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        for cam in C.ALL_CAMERAS:
+            self._write_camera(state, cam, out, [])
+        rows = wagon_report_rows(state, lr.load_camera_payloads(out), out)
+        self.assertEqual(len(rows), 57)
+        self.assertEqual([r["sr_no"] for r in rows], list(range(1, 58)))
+        self.assertEqual([r["global_wagon_id"] for r in rows],
+                         [f"GW_{i}" for i in range(1, 58)])
+
+    def test_missing_camera_never_shortens_the_table(self):
+        from inspection.combined_report import wagon_report_rows
+        state = roster(20)
+        seed_cache(self.cache, state, [C.CAMERA_LEFT_UP])
+        out = os.path.join(self.tmp, "out")
+        self._write_camera(state, C.CAMERA_LEFT_UP, out, [])
+        rows = wagon_report_rows(state, lr.load_camera_payloads(out), out)
+        self.assertEqual(len(rows), 20)
+
+    # ---- INSPECTION SUMMARY -----------------------------------------
+
+    def test_summary_fields_and_vocabulary(self):
+        from inspection.combined_report import summary_row, wagon_report_rows
+        state = roster(10)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        left = side_damage_row(3, door_status="partially_closed", partial=True)
+        left["partially_closed_band_info"] = [self._band()]
+        right = side_damage_row(4, door_status="open")
+        right["open_door_band_info"] = [self._band()]
+        self._write_camera(state, C.CAMERA_LEFT_UP, out, [left])
+        self._write_camera(state, C.CAMERA_RIGHT_UP, out, [right])
+        self._write_camera(state, C.CAMERA_RIGHT_UP_TOP, out,
+                           [top_damage_row(5, floor=True)])
+        self._write_camera(state, C.CAMERA_LEFT_UP_TOP, out,
+                           [top_damage_row(6, inner=True)])
+        rows = wagon_report_rows(state, lr.load_camera_payloads(out), out,
+                                 {f"GW_{i}": C.LOAD_LOADED for i in range(1, 11)})
+        s = summary_row(rows, TS)
+        self.assertEqual(sorted(s), ["date_time", "l_top_damages",
+                                     "left_open_doors", "loco_number",
+                                     "partial_closed", "r_top_damages",
+                                     "rake_type", "right_open_doors", "status",
+                                     "total_wagons"])
+        self.assertEqual(s["total_wagons"], 10)
+        self.assertEqual(s["left_open_doors"], 0)
+        self.assertEqual(s["right_open_doors"], 1)
+        self.assertEqual(s["r_top_damages"], 1)
+        self.assertEqual(s["l_top_damages"], 1)
+        self.assertEqual(s["partial_closed"], "L 1 / R 0")
+        self.assertEqual(s["rake_type"], "LOADED RAKE")
+        self.assertEqual(s["status"], "NOT OK")
+        self.assertEqual(s["loco_number"], "-", "OCR is disabled")
+
+    def test_clean_rake_is_ok(self):
+        from inspection.combined_report import summary_row, wagon_report_rows
+        state = roster(6)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        for cam in C.ALL_CAMERAS:
+            self._write_camera(state, cam, out, [])
+        rows = wagon_report_rows(state, lr.load_camera_payloads(out), out)
+        self.assertEqual(summary_row(rows, TS)["status"], "OK")
+
+    def test_total_wagons_is_the_roster_not_a_camera(self):
+        from inspection.combined_report import summary_row, wagon_report_rows
+        state = roster(31)
+        seed_cache(self.cache, state, [C.CAMERA_LEFT_UP], only_indices={2, 3})
+        out = os.path.join(self.tmp, "out")
+        self._write_camera(state, C.CAMERA_LEFT_UP, out, [])
+        rows = wagon_report_rows(state, lr.load_camera_payloads(out), out)
+        self.assertEqual(summary_row(rows, TS)["total_wagons"], 31)
+
+    # ---- WAGON TYPE ---------------------------------------------------
+
+    def test_wagon_type_vocabulary(self):
+        from inspection.combined_report import wagon_report_rows
+        state = roster(3)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        load = {"GW_1": C.LOAD_LOADED, "GW_2": C.LOAD_EMPTY}
+        for cam in C.ALL_CAMERAS:
+            self._write_camera(state, cam, out, [], load)
+        rows = {r["sr_no"]: r for r in
+                wagon_report_rows(state, lr.load_camera_payloads(out), out, load)}
+        self.assertEqual(rows[1]["wagon_type"], "LOADED")
+        self.assertEqual(rows[2]["wagon_type"], "EMPTY")
+        self.assertEqual(rows[3]["wagon_type"], "-",
+                         "an unknown load must not be guessed as EMPTY")
+
+    def test_wagon_number_is_dash_because_ocr_is_off(self):
+        from inspection.combined_report import wagon_report_rows
+        state = roster(4)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        for cam in C.ALL_CAMERAS:
+            self._write_camera(state, cam, out, [])
+        for row in wagon_report_rows(state, lr.load_camera_payloads(out), out):
+            self.assertEqual(row["wagon_number"], "-")
+
+    # ---- Damaged Wagon Report ----------------------------------------
+
+    def test_damaged_entries_match_the_reference_shape(self):
+        from inspection.combined_report import (damaged_wagon_entries,
+                                                wagon_report_rows)
+        state = roster(12)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        right = side_damage_row(9, door_status="open")
+        right["open_door_band_info"] = [self._band()]
+        self._write_camera(state, C.CAMERA_LEFT_UP, out, [])
+        self._write_camera(state, C.CAMERA_RIGHT_UP, out, [right])
+        self._write_camera(state, C.CAMERA_RIGHT_UP_TOP, out,
+                           [top_damage_row(9, floor=True)])
+        self._write_camera(state, C.CAMERA_LEFT_UP_TOP, out,
+                           [top_damage_row(9, inner=True)])
+        rows = wagon_report_rows(state, lr.load_camera_payloads(out), out)
+        entries = damaged_wagon_entries(rows, out, TS)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["wagon_id"], 9)
+        self.assertEqual(entry["global_wagon_id"], "GW_9")
+        self.assertEqual(entry["wagon_number"], "-")
+        self.assertEqual(entry["angles"], "Left-Top, Right, Right-Top",
+                         "angles read alphabetically, as in the reference")
+        self.assertIn("IST", entry["date_time"])
+
+    def test_clean_rake_has_no_damaged_section(self):
+        from inspection.combined_report import (damaged_wagon_entries,
+                                                wagon_report_rows)
+        state = roster(5)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        for cam in C.ALL_CAMERAS:
+            self._write_camera(state, cam, out, [])
+        rows = wagon_report_rows(state, lr.load_camera_payloads(out), out)
+        self.assertEqual(damaged_wagon_entries(rows, out, TS), [])
+
+    def test_evidence_images_are_captioned_per_camera_and_problem(self):
+        from inspection.combined_report import (damaged_wagon_entries,
+                                                wagon_report_rows)
+        import cv2
+        import numpy as np
+
+        state = roster(6)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        right = side_damage_row(4, door_status="open")
+        right["open_door_band_info"] = [self._band()]
+        self._write_camera(state, C.CAMERA_RIGHT_UP, out, [right])
+        work = self._write_camera(state, C.CAMERA_LEFT_UP_TOP, out,
+                                  [top_damage_row(4, inner=True)])
+        self._write_camera(state, C.CAMERA_LEFT_UP, out, [])
+        self._write_camera(state, C.CAMERA_RIGHT_UP_TOP, out, [])
+        img = os.path.join(self.tmp, "ev.jpg")
+        cv2.imwrite(img, np.zeros((40, 60, 3), dtype=np.uint8))
+        pd.DataFrame([{"wagon_id": 4, "problem_type": "inner_wall_dmg",
+                       "frame_number": 5, "frame_path": img,
+                       "annotated_image_path": img, "bounding_box": []}]
+                     ).to_csv(os.path.join(work, "problem_frames.csv"),
+                              index=False)
+        rows = wagon_report_rows(state, lr.load_camera_payloads(out), out)
+        entry = damaged_wagon_entries(rows, out, TS)[0]
+        self.assertEqual([i["caption"] for i in entry["images"]],
+                         ["Left-Top Camera – Damage"])
+
+    # ---- the document -------------------------------------------------
+
+    def test_report_renders_with_the_expected_sections(self):
+        from pypdf import PdfReader
+
+        from inspection.combined_report import build_combined_report_pdf
+
+        state = roster(30)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        right = side_damage_row(7, door_status="open")
+        right["open_door_band_info"] = [self._band()]
+        self._write_camera(state, C.CAMERA_RIGHT_UP, out, [right])
+        self._write_camera(state, C.CAMERA_LEFT_UP, out, [])
+        self._write_camera(state, C.CAMERA_RIGHT_UP_TOP, out, [])
+        self._write_camera(state, C.CAMERA_LEFT_UP_TOP, out, [])
+        path = os.path.join(self.tmp, "combined.pdf")
+        build_combined_report_pdf(
+            state=state, output_root=out,
+            payloads=lr.load_camera_payloads(out), output_path=path,
+            source_video_urls={c: "https://e/r.mp4" for c in C.ALL_CAMERAS},
+            processed_video_urls={c: "https://e/p.mp4" for c in C.ALL_CAMERAS},
+            camera_report_urls={c: "https://e/x.pdf" for c in C.ALL_CAMERAS},
+            when=TS)
+        self.assertTrue(os.path.getsize(path) > 0)
+        text = "\n".join((p.extract_text() or "") for p in PdfReader(path).pages)
+        for heading in ("COMBINED WAGON EYE REPORT", "VIDEO EVIDENCE",
+                        "DETAILED REPORTS", "INSPECTION SUMMARY",
+                        "WAGON INSPECTION DETAILS", "Damaged Wagon Report",
+                        "Total Damaged Wagons: 1"):
+            self.assertIn(heading, text, f"missing section: {heading}")
+        for column in ("SR.NO", "WAGON NUMBER", "LEFT CAMERA", "RIGHT CAMERA",
+                       "R-TOP", "L-TOP", "WAGON", "Click to View",
+                       "LEFT Detail Report", "L-TOP Detail Report"):
+            self.assertIn(column, text, f"missing column/label: {column}")
+
+    def test_every_global_wagon_appears_in_the_rendered_table(self):
+        from pypdf import PdfReader
+
+        from inspection.combined_report import build_combined_report_pdf
+
+        state = roster(45)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        out = os.path.join(self.tmp, "out")
+        for cam in C.ALL_CAMERAS:
+            self._write_camera(state, cam, out, [])
+        path = os.path.join(self.tmp, "c.pdf")
+        build_combined_report_pdf(state=state, output_root=out,
+                                  payloads=lr.load_camera_payloads(out),
+                                  output_path=path, when=TS)
+        reader = PdfReader(path)
+        text = "\n".join((p.extract_text() or "") for p in reader.pages)
+        # SR.NO appears once per wagon; the table header repeats per page.
+        self.assertEqual(text.count("NO DOOR DETECTED"), 45 * 2,
+                         "every wagon must have a left and a right door cell")
+        self.assertGreaterEqual(reader.pages.__len__(), 4)
+
+    def test_renderer_runs_no_model(self):
+        """Same guarantee as legacy_render: layout consumes persisted state."""
+        import ast
+
+        from inspection import combined_report as cr
+        tree = ast.parse(open(cr.__file__, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            for name in names:
+                self.assertNotIn(name.split(".")[0],
+                                 {"ultralytics", "torch", "torchvision"},
+                                 f"combined_report imports {name}")
+            if isinstance(node, ast.Call):
+                func = node.func
+                called = (func.id if isinstance(func, ast.Name)
+                          else func.attr if isinstance(func, ast.Attribute)
+                          else "")
+                self.assertNotIn(called, {"YOLO", "DamageDetector", "predict",
+                                          "ProblemFrameExtractor"})
+
+
+def _publish_and_build(state, camera_id, cache_root, tmp):
+    """Build a payload with real published evidence frames."""
+    profile = gb.camera_profile(camera_id)
+    windows = windows_for(state, camera_id)
+    full_df = gb.build_segment_summary(
+        state, camera_id, windows, cache_root,
+        require_frames=False, include_unwindowed=True)
+    count_map = gb.build_wagon_count_map(full_df)
+    sink = li.LocalArtifactSink(os.path.join(tmp, "artifacts"))
+    publisher = ArtifactPublisher(
+        s3=sink, artifact_bucket="bucket", region="ap-south-1",
+        camera_folder=profile.folder, damage_flavour=profile.flavour)
+    _ts, index, loco, problems = publisher.publish(
+        upload_timestamp=TS, segment_summary_df=full_df,
+        loco_summary_df=pd.DataFrame(), problem_frames_df=pd.DataFrame(),
+        wagon_count_map=count_map, local_workdir=tmp)
+    return build_inspection_json(
+        camera_folder=profile.folder, raw_video_name="clip",
+        upload_timestamp=TS, direction=profile.loaded_direction,
+        flavour=profile.flavour, segment_summary_df=full_df,
+        damage_results_df=li._empty_damage_df(profile.flavour),
+        loco_summary_df=pd.DataFrame(), problem_frames_df=pd.DataFrame(),
+        wagon_frames_index=index, loco_frame_entries=loco,
+        problem_frame_entries=problems, wagon_count_map=count_map,
+        segment_type_map=gb.build_segment_type_map(full_df, profile.flavour),
+        wagon_number_results=None, loco_numbers=None, damage_model_active=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

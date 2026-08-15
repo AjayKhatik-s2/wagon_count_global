@@ -52,25 +52,39 @@ def _camera_dir(output_root: str, camera_id: str) -> str:
     return os.path.join(output_root, gb.camera_profile(camera_id).legacy_name)
 
 
+INTERNAL_JSON_NAME = "inspection_data.internal.json"
+DASHBOARD_JSON_NAME = "inspection_data.json"
+
+
 def load_camera_payloads(output_root: str,
                          cameras: Optional[Sequence[str]] = None
                          ) -> Dict[str, Dict[str, Any]]:
-    """Read each camera's persisted ``inspection_data.json``.
+    """Read each camera's persisted payload.
+
+    Prefers ``inspection_data.internal.json``, because the dashboard file is
+    trimmed to the exact legacy contract and therefore carries no
+    ``global_wagon_id`` / ``inspection_status`` -- the two fields the combined
+    report uses to label a wagon and to tell "not seen" from "seen and clean".
+    Falls back to the dashboard file, which still renders correctly: a segment
+    with no ``inspection_status`` is treated as observed, which is what the
+    legacy report assumed for every row it printed.
 
     A camera whose JSON is missing or unreadable is simply absent from the
     result -- reported as such, never substituted with an empty-but-clean blob.
     """
     out: Dict[str, Dict[str, Any]] = {}
     for camera_id in (cameras or C.ALL_CAMERAS):
-        path = os.path.join(_camera_dir(output_root, camera_id),
-                            "inspection_data.json")
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, encoding="utf-8") as fh:
-                out[camera_id] = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            continue
+        base = _camera_dir(output_root, camera_id)
+        for name in (INTERNAL_JSON_NAME, DASHBOARD_JSON_NAME):
+            path = os.path.join(base, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    out[camera_id] = json.load(fh)
+                break
+            except (OSError, json.JSONDecodeError):
+                continue
     return out
 
 
@@ -304,77 +318,48 @@ def build_combined_pdf(
     payloads: Optional[Dict[str, Dict[str, Any]]] = None,
     load_status_by_wagon: Optional[Dict[str, str]] = None,
     batch_key: str = "",
-    rows_per_page: int = 18,
+    rows_per_page: int = 14,
+    source_video_urls: Optional[Dict[str, str]] = None,
+    processed_video_urls: Optional[Dict[str, str]] = None,
+    camera_report_urls: Optional[Dict[str, str]] = None,
+    logo_path: Optional[str] = None,
+    when: Optional[Any] = None,
     verbose: bool = True,
 ) -> Optional[str]:
-    """The combined report. Legacy sections, global roster as the authority.
+    """THE COMBINED WAGON EYE REPORT.
 
-    Sections, in legacy order:
-        1. Title / KPI banner
-        2. Per-camera summary
-        3. Per-wagon status table -- GW_1..GW_N, one row each, always
-        4. Per-camera totals
-        5. Problem-frame gallery
+    Layout lives in :mod:`inspection.combined_report`, which reproduces the
+    production document: banner, VIDEO EVIDENCE, DETAILED REPORTS, INSPECTION
+    SUMMARY, the paged WAGON INSPECTION DETAILS table, and the Damaged Wagon
+    Report with per-wagon evidence panels.
+
+    Everything is read from persisted state; the row set is the global roster,
+    so the table has exactly one row per GW_1..GW_N.
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
+    from datetime import datetime
+
+    from .combined_report import build_combined_report_pdf
 
     payloads = payloads if payloads is not None else load_camera_payloads(output_root)
-    rows = combined_wagon_rows(state, payloads, load_status_by_wagon)
     report_dir = os.path.join(output_root, "reports")
     os.makedirs(report_dir, exist_ok=True)
     output_path = os.path.join(report_dir, "combined_inspection_report.pdf")
 
-    page = (11.69, 8.27)
     try:
-        with PdfPages(output_path) as pdf:
-            # --- 1. title / KPIs -------------------------------------------
-            fig = plt.figure(figsize=page)
-            fig.suptitle("WAGON EYE | TRAIN INSPECTION REPORT",
-                         fontsize=22, fontweight="bold")
-            ax = fig.add_subplot(1, 1, 1)
-            ax.axis("off")
-            n_damage = sum(1 for r in rows if r["damage_status"] == "DAMAGE")
-            n_open = sum(1 for r in rows if r["door_status"] == "open")
-            n_partial = sum(1 for r in rows
-                            if r["door_status"] == "partially_closed")
-            n_loaded = sum(1 for r in rows if r["load_status"] == C.LOAD_LOADED)
-            n_empty = sum(1 for r in rows if r["load_status"] == C.LOAD_EMPTY)
-            lines = [
-                ("Batch", batch_key or os.path.basename(os.path.abspath(output_root))),
-                ("Global wagons (authoritative)", len(rows)),
-                ("Cameras reporting", f"{len(payloads)} of {len(C.ALL_CAMERAS)}"),
-                ("Damaged wagons", n_damage),
-                ("Doors open / partially closed", f"{n_open} / {n_partial}"),
-                ("Loaded / empty", f"{n_loaded} / {n_empty}"),
-                ("Wagon identity source", "global wagon counting (GW_1..GW_N)"),
-                ("OCR", "disabled (wagon/loco numbers not read)"),
-            ]
-            y = 0.85
-            for label, value in lines:
-                ax.text(0.05, y, f"{label}:", fontsize=13, fontweight="bold")
-                ax.text(0.55, y, str(value), fontsize=13)
-                y -= 0.075
-            pdf.savefig(fig, bbox_inches="tight")
-            plt.close(fig)
-
-            # --- 2. per-camera summary -------------------------------------
-            _camera_summary_page(pdf, plt, page, payloads)
-
-            # --- 3. per-wagon table: EVERY global wagon --------------------
-            _wagon_table_pages(pdf, plt, page, rows, payloads, rows_per_page)
-
-            # --- 4. per-camera totals --------------------------------------
-            _camera_totals_page(pdf, plt, page, payloads)
-
-            # --- 5. problem frames -----------------------------------------
-            _problem_gallery(pdf, plt, page, output_root, payloads)
-
+        build_combined_report_pdf(
+            state=state, output_root=output_root, payloads=payloads,
+            output_path=output_path,
+            load_status_by_wagon=load_status_by_wagon,
+            source_video_urls=source_video_urls,
+            processed_video_urls=processed_video_urls,
+            camera_report_urls=camera_report_urls,
+            logo_path=logo_path,
+            when=when or datetime.now(),
+            rows_per_page=rows_per_page)
         if verbose:
+            n = len(gb._iter_roster(state))
             print(f"    [REPORT] combined -> {output_path} "
-                  f"({len(rows)} global wagon rows)")
+                  f"({n} global wagon rows)")
         return output_path
     except Exception as exc:                           # noqa: BLE001
         if verbose:
@@ -589,6 +574,24 @@ def build_annotated_videos(
 
 # ---------------------------------------------------------------------------
 
+def _urls_from_payloads(payloads: Dict[str, Dict[str, Any]], key: str,
+                        first_of_list: bool = False) -> Dict[str, str]:
+    """Collect one URL per camera out of the persisted payloads.
+
+    The links on the report's front page are the ones the JSON already
+    published, so the PDF and the dashboard point a reviewer at the same
+    artifacts instead of each deriving its own.
+    """
+    out: Dict[str, str] = {}
+    for camera_id, payload in payloads.items():
+        value = (payload.get("inspection_data", {}) or {}).get(key)
+        if first_of_list:
+            value = value[0] if isinstance(value, list) and value else None
+        if value:
+            out[camera_id] = str(value)
+    return out
+
+
 def build_all_legacy_outputs(
     state: Any,
     output_root: str,
@@ -597,6 +600,7 @@ def build_all_legacy_outputs(
     load_status_by_wagon: Optional[Dict[str, str]] = None,
     batch_key: str = "",
     build_videos: bool = False,
+    logo_path: Optional[str] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """Every renderer, in one call, all from persisted state."""
@@ -607,7 +611,14 @@ def build_all_legacy_outputs(
         "combined_pdf": build_combined_pdf(
             state, output_root, payloads=payloads,
             load_status_by_wagon=load_status_by_wagon,
-            batch_key=batch_key, verbose=verbose),
+            batch_key=batch_key,
+            source_video_urls=_urls_from_payloads(
+                payloads, "raw_video_urls", first_of_list=True),
+            processed_video_urls=_urls_from_payloads(
+                payloads, "detected_video_url"),
+            camera_report_urls=_urls_from_payloads(payloads, "pdf_report_url"),
+            logo_path=logo_path,
+            when=upload_timestamp, verbose=verbose),
         "cameras_reporting": sorted(payloads),
         "global_wagon_count": len(gb._iter_roster(state)),
     }
