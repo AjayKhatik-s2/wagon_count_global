@@ -105,11 +105,38 @@ There is no second side model, so no side detection is counted twice. The
 `damage` class remains a damage finding — `door_status` is voted only over the
 three door classes.
 
-`--door-source` selects between the two legacy door implementations
-(`legacy` = vendored `DamageDetector`, default; `old_code` = `DoorTracker`).
-**Exactly one runs**, because both consume `door_state.pt` on the same frames.
-
 `Unlabeled` maps to neither state and abstains, as required.
+
+### One owner per task
+
+`old_code` and the legacy layer can both detect on the **same weights over the
+same cached frames** — door here and the legacy side pass both read
+`door_state.pt`; damage here and the legacy top pass both read `top_damage.pt`.
+Running a pair would load one model twice and produce two verdicts for one
+question, with whichever was reconciled last silently winning. The runner
+therefore enables exactly one of each pair:
+
+| Flags | old_code door | old_code damage | legacy side | legacy top |
+|---|---|---|---|---|
+| *(default)* | off | off | **on** | **on** |
+| `--door-source old_code` | **on** | off | off | **on** |
+| `--no-legacy-inspection` | off | **on** | off | off |
+| `--no-damage` | off | off | **on** | off |
+| `--no-door` | off | off | off | **on** |
+
+No row has two owners for one task. Load is always `old_code`'s — the vendored
+engine has no load feature, so there is no pair to resolve.
+
+When a pass is off, its cameras still emit their JSON (the global wagon count
+must appear in all four files regardless) with `damage_model_active: false`, and
+each wagon's `inspection_status` records that the feature *did not run* rather
+than that it found nothing. `apply_to_unified` reads that same flag, so a
+disabled pass can never overwrite the verdict of the implementation that was
+actually selected.
+
+`--door-source old_code` is a diagnostic A/B path, not a production one: the
+side model is a single 4-class detector, so turning its pass off also gives up
+**side damage**, which `old_code` has no equivalent for.
 
 ---
 

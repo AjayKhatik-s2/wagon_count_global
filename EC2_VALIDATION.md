@@ -209,10 +209,33 @@ expected set. A model whose classes do not match the flavour it was wired to is
 **disabled and reported**, never run — an unmatched class set would otherwise
 silently report a clean train.
 
-`--door-source` selects which door implementation runs. `legacy` (default) uses
-the ported `DamageDetector`; `old_code` uses the `DoorTracker` path. **Exactly
-one runs** — both consume `door_state.pt` on the same frames, so enabling both
-would load the model twice and produce two verdicts for one question.
+### One owner per task
+
+`old_code` and the legacy layer can both detect on the same weights over the
+same frames — door / legacy-side both read `door_state.pt`, damage / legacy-top
+both read `top_damage.pt`. The runner enables exactly one of each pair:
+
+| Flags | old_code door | old_code damage | legacy side | legacy top |
+|---|---|---|---|---|
+| *(default)* | off | off | **on** | **on** |
+| `--door-source old_code` | **on** | off | off | **on** |
+| `--no-legacy-inspection` | off | **on** | off | off |
+| `--no-damage` | off | off | **on** | off |
+| `--no-door` | off | off | off | **on** |
+
+Load is always `old_code`'s — the vendored engine has no load feature.
+
+A pass that is off still emits its camera JSON (so the global count appears in
+all four files) with `damage_model_active: false`, and each wagon's
+`inspection_status` says the feature *did not run* rather than that it found
+nothing.
+
+- [ ] Confirm the log shows `damage_model_active: true` for the passes you
+      expect and `false` for the ones you disabled
+- [ ] Confirm no weight file is loaded twice in one run
+
+`--door-source old_code` is a diagnostic A/B path: the side model is one
+4-class detector, so disabling its pass also gives up **side damage**.
 
 ### Verify the models before a run
 

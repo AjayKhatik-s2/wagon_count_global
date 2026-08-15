@@ -91,6 +91,9 @@ import evidence_report as er
 from inspection import old_features as oldf
 from inspection import old_report as oldr
 from inspection import wagon_cache as iwc
+from inspection import legacy_inspection as legi
+from inspection import legacy_render as legr
+from core import constants as C
 from core import global_state_loader as core_state
 
 
@@ -280,6 +283,50 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    default=iwc.WagonCacheConfig().max_frames_per_wagon,
                    help="Ceiling on cached frames per (wagon, camera) "
                         f"(default {iwc.WagonCacheConfig().max_frames_per_wagon})")
+
+    # ---- legacy inspection outputs: dashboard JSON / PDF / artifacts ---------
+    #
+    # This is the ported Train-Inspection-Engine output layer. It consumes the
+    # FINALIZED roster and emits the legacy per-camera inspection_data.json, the
+    # evidence artifacts and the legacy PDFs. It cannot affect the wagon count.
+    p.add_argument("--no-legacy-inspection", action="store_true",
+                   help="Skip the legacy inspection output layer (per-camera "
+                        "inspection_data.json, evidence artifacts, legacy PDFs). "
+                        "The wagon count is unaffected either way.")
+    p.add_argument("--door-source", choices=("legacy", "old_code"),
+                   default="legacy",
+                   help="Which door/side-damage implementation runs. 'legacy' "
+                        "(default) uses the ported DamageDetector, which is the "
+                        "one that produces the dashboard's door_status / "
+                        "door_close_detected / door_partial_detected and the "
+                        "problem frames. 'old_code' uses the DoorTracker path "
+                        "instead, for A/B comparison. EXACTLY ONE runs: both "
+                        "consume door_state.pt on the same frames, so running "
+                        "both would load the model twice and produce two "
+                        "verdicts for one question.")
+    p.add_argument("--side-model", default=legi.LegacyInspectionConfig().side_model,
+                   help="Side door+damage weights: a filename in --models-dir, a "
+                        "path, or an s3://bucket/key URI. AUTHORITATIVE for the "
+                        "side task; replaces the legacy V4_side_damage.pt "
+                        "(default: door_state.pt)")
+    p.add_argument("--top-model", default=legi.LegacyInspectionConfig().top_model,
+                   help="Top damage weights: filename, path or s3:// URI. "
+                        "AUTHORITATIVE for top damage (default: top_damage.pt)")
+    p.add_argument("--artifact-bucket", default="",
+                   help="S3 bucket (or bucket/prefix) for inspection artifacts. "
+                        "Empty writes them to <output>/artifacts/ instead, with "
+                        "the identical layout and filenames.")
+    p.add_argument("--upload-artifacts", action="store_true",
+                   help="Actually upload artifacts and inspection_data.json to "
+                        "--artifact-bucket. Off by default so a run never "
+                        "publishes without being asked.")
+    p.add_argument("--aws-region", default="ap-south-1",
+                   help="Region used to build artifact https URLs (default: "
+                        "ap-south-1)")
+    p.add_argument("--annotated-videos", action="store_true",
+                   help="Also write the legacy annotated videos (damage/door "
+                        "boxes drawn from the PERSISTED detections -- no second "
+                        "model pass). Expensive: re-encodes every camera.")
 
     # ---- fragment reassembly: rebuild physical gaps before validating them ---
     _fs = fstitch.DEFAULT_FRAGMENT_STITCH
@@ -1048,12 +1095,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         _insp_t0 = time.time()
         _roster_before = core_state.roster_hash(state)
         try:
+            # The frame cache must survive the old features when the legacy
+            # output layer still has to read it. It is cleared below instead.
+            _legacy_enabled = not args.no_legacy_inspection
             insp_cfg = oldf.OldInspectionConfig(
                 enabled=True,
-                keep_cache=bool(args.keep_wagon_cache),
-                run_door=not args.no_door,
+                keep_cache=bool(args.keep_wagon_cache) or _legacy_enabled,
+                # ONE OWNER PER TASK.
+                #
+                # old_code and the legacy layer can both detect on the SAME
+                # weights over the SAME cached frames: door here and the legacy
+                # side pass both read door_state.pt; damage here and the legacy
+                # top pass both read top_damage.pt. Running a pair would load
+                # one model twice and produce two verdicts for one question,
+                # with whichever was reconciled last silently winning.
+                #
+                #   door   -> old_code only when --door-source old_code
+                #   damage -> old_code only when the legacy layer is off, since
+                #             the legacy top pass is what feeds the dashboard
+                #             JSON's damage fields
+                #   load   -> always old_code; the legacy engine has no load
+                #             feature at all, so there is no pair to resolve
+                run_door=(not args.no_door and args.door_source == "old_code"),
                 run_load=not args.no_load,
-                run_damage=not args.no_damage,
+                run_damage=(not args.no_damage and not _legacy_enabled),
                 cache=iwc.WagonCacheConfig(
                     every_nth=int(args.wagon_cache_every_nth),
                     max_frames_per_wagon=int(args.wagon_cache_max_frames)),
@@ -1078,14 +1143,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             for w in inspection_result.warnings:
                 print(f"  NOTE: {w}")
 
-            # ---- reports: old combined report + per-camera reports ----------
-            if not args.no_report and inspection_result.unified:
-                report_paths = oldr.build_all_reports(
-                    state=state, unified=inspection_result.unified,
-                    output_root=args.output,
-                    batch_key=os.path.basename(os.path.abspath(args.output)),
-                    camera_status=inspection_result.camera_status,
-                    verbose=verbose)
+            # The old combined report is built LATER, after the legacy layer has
+            # produced its verdicts and they have been folded into `unified` --
+            # otherwise the PDF would report NO_DATA for doors while the
+            # dashboard JSON reported a real state, which is two artifacts of one
+            # run disagreeing about the same wagon.
         except Exception as exc:
             msg = (f"inspection stage failed: {type(exc).__name__}: {exc} -- "
                    f"the wagon count above is unaffected")
@@ -1112,6 +1174,175 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "camera_pdfs": {k: v for k, v in
                                 (report_paths.get("cameras") or {}).items()},
             }
+
+    # ------------------------------------------------------------------
+    # STEPS 12-14  Legacy inspection OUTPUT layer
+    #
+    #   finalized roster -> per-camera legacy DataFrames -> legacy
+    #   DamageDetector / ProblemFrameExtractor / ArtifactPublisher /
+    #   json_builder -> inspection_data.json -> legacy PDFs -> annotated videos
+    #
+    # This is the dashboard-compatible half of the port. It READS the roster and
+    # the frame cache and writes only its own files. Three protections, same as
+    # above: the roster is hashed and re-verified in a `finally`; every wagon
+    # identity it emits is checked against the roster; and any failure degrades
+    # to a warning, because a wagon count that already succeeded must never be
+    # lost to a downstream report.
+    # ------------------------------------------------------------------
+    legacy_result = None
+    if not args.no_legacy_inspection:
+        print()
+        print("-" * 70)
+        print("  STEPS 12-14  Legacy inspection outputs "
+              "(dashboard JSON / evidence / PDF)")
+        print("-" * 70)
+        _leg_t0 = time.time()
+        _roster_before_legacy = core_state.roster_hash(state)
+        try:
+            # Planning touches no video: it is the same deterministic mapping
+            # the cache was built from, recomputed so the windows are available
+            # here without threading the plan object through the old stage.
+            _cache_cfg = iwc.WagonCacheConfig(
+                every_nth=int(args.wagon_cache_every_nth),
+                max_frames_per_wagon=int(args.wagon_cache_max_frames))
+            legacy_plan = iwc.plan_cache(state, tracks, args.output,
+                                         cfg=_cache_cfg)
+
+            # The frame cache is normally built by the stage above. When that
+            # stage was skipped (--no-inspection) this layer still needs it, so
+            # it is built here rather than silently reporting every wagon as
+            # NOT_VISIBLE. `skip_existing` makes this a no-op when the cache is
+            # already populated, so the videos are never decoded twice.
+            if args.no_inspection:
+                print("  [CACHE] building wagon frame cache "
+                      "(--no-inspection skipped the stage that normally does)")
+                iwc.build_wagon_cache(legacy_plan, tracks, _cache_cfg,
+                                      verbose=verbose)
+
+            # LOAD comes from the old_code load feature and is the ONLY input
+            # the legacy top flavour needs from it: it decides wagon_loaded vs
+            # wagon, which drives both the wagons_loaded/empty counts and the
+            # legacy suppression of floor damage on a loaded wagon.
+            load_by_wagon = {}
+            if inspection_result is not None:
+                load_by_wagon = {
+                    gid: u.load_status
+                    for gid, u in inspection_result.unified.items()
+                    if u.load_status in (C.LOAD_LOADED, C.LOAD_EMPTY)
+                }
+
+            s3_client = None
+            if args.upload_artifacts and args.artifact_bucket:
+                from inspection.legacy.s3 import S3Client
+                s3_client = S3Client(region=args.aws_region)
+
+            legacy_result = legi.run_legacy_inspection(
+                state=state, tracks_by_camera=tracks, plan=legacy_plan,
+                models_dir=args.models_dir,
+                output_root=os.path.join(args.output, "inspection"),
+                cfg=legi.LegacyInspectionConfig(
+                    side_model=args.side_model,
+                    top_model=args.top_model,
+                    # The other half of the one-owner rule above. The side pass
+                    # runs only when this layer owns the door task; the top pass
+                    # owns damage whenever this layer is enabled.
+                    run_side_damage=(not args.no_door
+                                     and args.door_source == "legacy"),
+                    run_top_damage=not args.no_damage,
+                    artifact_bucket=args.artifact_bucket,
+                    region=args.aws_region,
+                    # Opt-in, and only with somewhere to put them.
+                    upload_to_s3=bool(args.upload_artifacts
+                                      and args.artifact_bucket),
+                    build_annotated_video=bool(args.annotated_videos)),
+                load_status_by_wagon=load_by_wagon,
+                s3_client=s3_client, verbose=verbose)
+
+            print()
+            print(f"  global wagons (authority) : {legacy_result.global_wagon_count}")
+            for cam, cam_res in sorted(legacy_result.cameras.items()):
+                print(f"  {cam:<13} JSON wagons: {cam_res.wagons_in_json:<4} "
+                      f"scanned: {cam_res.wagons_scanned:<4} "
+                      f"problem frames: {cam_res.problem_frames}")
+            for w in legacy_result.warnings:
+                print(f"  NOTE: {w}")
+
+            # ---- ONE set of verdicts behind every artifact ------------------
+            if inspection_result is not None and inspection_result.unified:
+                applied = legi.apply_to_unified(inspection_result.unified,
+                                                legacy_result)
+                print(f"  reconciled into report    : "
+                      f"door={applied['door']} side_damage={applied['side_damage']} "
+                      f"top_damage={applied['top_damage']}")
+
+            # ---- renderers: persisted state only, never a second model pass --
+            if not args.no_report:
+                from datetime import datetime as _dt
+                # The old combined + per-camera reports, now that `unified`
+                # carries the legacy verdicts. Built here so every document in
+                # this run describes the same detections.
+                if inspection_result is not None and inspection_result.unified:
+                    report_paths = oldr.build_all_reports(
+                        state=state, unified=inspection_result.unified,
+                        output_root=args.output,
+                        batch_key=os.path.basename(os.path.abspath(args.output)),
+                        camera_status=inspection_result.camera_status,
+                        verbose=verbose)
+                    state.inspection = inspection_result.to_dict()
+                    state.inspection["reports"] = {
+                        "combined_json": (report_paths.get("combined") or {}).get("json_path"),
+                        "combined_pdf": (report_paths.get("combined") or {}).get("pdf_path"),
+                        "camera_pdfs": dict(report_paths.get("cameras") or {}),
+                    }
+                legacy_paths = legr.build_all_legacy_outputs(
+                    state=state,
+                    output_root=os.path.join(args.output, "inspection"),
+                    upload_timestamp=_dt.now(),
+                    tracks_by_camera=tracks,
+                    load_status_by_wagon=load_by_wagon,
+                    batch_key=os.path.basename(os.path.abspath(args.output)),
+                    build_videos=bool(args.annotated_videos),
+                    verbose=verbose)
+            else:
+                legacy_paths = {}
+        except Exception as exc:
+            msg = (f"legacy inspection outputs failed: {type(exc).__name__}: "
+                   f"{exc} -- the wagon count above is unaffected")
+            print(f"WARNING: {msg}", file=sys.stderr)
+            state.add_note(msg)
+            traceback.print_exc(limit=3)
+            legacy_paths = {}
+        finally:
+            core_state.assert_roster_unchanged(state, _roster_before_legacy)
+            print(f"  legacy inspection elapsed : {time.time() - _leg_t0:.1f}s")
+
+        if legacy_result is not None:
+            state.inspection = dict(state.inspection or {})
+            state.inspection["legacy_outputs"] = legacy_result.to_dict()
+            if legacy_paths:
+                state.inspection["legacy_outputs"]["reports"] = legacy_paths
+    elif (not args.no_report and inspection_result is not None
+            and inspection_result.unified):
+        # Legacy outputs disabled: the old reports are the only ones, so they
+        # are built here instead. Same call, same view model -- only the point
+        # in the run differs, because there is no legacy verdict to fold in.
+        report_paths = oldr.build_all_reports(
+            state=state, unified=inspection_result.unified,
+            output_root=args.output,
+            batch_key=os.path.basename(os.path.abspath(args.output)),
+            camera_status=inspection_result.camera_status, verbose=verbose)
+        state.inspection = inspection_result.to_dict()
+        state.inspection["reports"] = {
+            "combined_json": (report_paths.get("combined") or {}).get("json_path"),
+            "combined_pdf": (report_paths.get("combined") or {}).get("pdf_path"),
+            "camera_pdfs": dict(report_paths.get("cameras") or {}),
+        }
+
+    # The frame cache is per-train state: leaving GW_1..GW_N of one train on
+    # disk would let the next train's GW_1 read the previous train's frames.
+    if not args.keep_wagon_cache:
+        iwc.clear_wagon_cache(
+            os.path.join(args.output, iwc.CACHE_DIRNAME), verbose=verbose)
 
     # ------------------------------------------------------------------
     # STEP 4 -- write JSON

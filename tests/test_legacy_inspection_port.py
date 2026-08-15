@@ -1447,6 +1447,156 @@ class TestRunnerWiring(unittest.TestCase):
     def test_upload_is_opt_in(self):
         self.assertIn("args.upload_artifacts and args.artifact_bucket", self.src)
 
+    def test_old_code_damage_is_off_when_the_legacy_layer_owns_it(self):
+        """Both read top_damage.pt; only one may run."""
+        self.assertIn("run_damage=(not args.no_damage and not _legacy_enabled)",
+                      self.src)
+
+    def test_legacy_side_pass_is_off_when_old_code_owns_the_door(self):
+        """Both read door_state.pt; only one may run."""
+        self.assertIn('args.door_source == "legacy"', self.src)
+        self.assertIn("run_side_damage=", self.src)
+
+    def test_legacy_inspection_is_genuinely_skippable(self):
+        self.assertIn("if not args.no_legacy_inspection:", self.src)
+
+
+# ---------------------------------------------------------------------------
+# 18. ONE OWNER PER TASK  (behavioural, not textual)
+# ---------------------------------------------------------------------------
+
+class TestOneOwnerPerTask(TempCase):
+    """No model may be run twice over the same frames in one execution.
+
+    These drive the real config objects rather than reading the runner's text,
+    so they fail if the gating stops working even while the wiring line stays.
+    """
+
+    def _run(self, cfg):
+        state = roster(4)
+        seed_cache(self.cache, state, C.ALL_CAMERAS)
+        plan = FakePlan(self.cache, windows_for(state, C.CAMERA_RIGHT_UP)
+                        + windows_for(state, C.CAMERA_RIGHT_UP_TOP),
+                        {c: "RESOLVED" for c in C.ALL_CAMERAS})
+        return state, li.run_legacy_inspection(
+            state=state,
+            tracks_by_camera={c: FakeTracks() for c in C.ALL_CAMERAS},
+            plan=plan, models_dir=os.path.join(ROOT, "models"),
+            output_root=os.path.join(self.tmp, "out"), cfg=cfg, verbose=False)
+
+    def test_disabled_side_pass_does_not_run_a_model(self):
+        cfg = li.LegacyInspectionConfig(run_side_damage=False,
+                                        run_top_damage=False)
+        _state, res = self._run(cfg)
+        side = res.cameras[C.CAMERA_RIGHT_UP]
+        self.assertFalse(
+            side.payload["inspection_data"]["damage_model_active"],
+            "a disabled pass must advertise that no model ran")
+        self.assertTrue(any("disabled" in w for w in side.warnings))
+
+    def test_disabled_pass_still_reports_every_global_wagon(self):
+        """Turning a pass off must not shrink the count in that camera's JSON."""
+        cfg = li.LegacyInspectionConfig(run_side_damage=False,
+                                        run_top_damage=False)
+        state, res = self._run(cfg)
+        for camera_id, cam in res.cameras.items():
+            data = cam.payload["inspection_data"]
+            self.assertEqual(data["global_wagon_count"], len(state.wagons),
+                             camera_id)
+            self.assertEqual(
+                data["total_wagons"] + data.get("num_engines", 0)
+                + data.get("num_brakevans", 0), len(state.wagons), camera_id)
+
+    def test_disabled_pass_never_claims_a_negative_finding(self):
+        """NO_DETECTION asserts the model looked and found nothing."""
+        cfg = li.LegacyInspectionConfig(run_side_damage=False,
+                                        run_top_damage=False)
+        _state, res = self._run(cfg)
+        for camera_id, cam in res.cameras.items():
+            for seg in cam.payload["inspection_data"]["wagon_segments"]:
+                self.assertNotEqual(
+                    seg["inspection_status"], li.STATUS_NO_DETECTION,
+                    f"{camera_id} GW {seg['wagon_count']}: a check that never "
+                    f"ran must not report a real negative finding")
+
+    def test_disabled_pass_cannot_overwrite_the_other_implementation(self):
+        """The `--door-source old_code` guarantee, exercised end to end."""
+        from core.unified_wagon_state import UnifiedWagonState
+
+        state = roster(4)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP])
+        # What old_code's DoorTracker would have concluded.
+        unified = {w.global_id: UnifiedWagonState(global_id=w.global_id)
+                   for w in state.wagons}
+        unified["GW_2"].right_door = C.DOOR_OPEN
+
+        payload = build_json_for(state, C.CAMERA_RIGHT_UP, self.cache)
+        payload["inspection_data"]["damage_model_active"] = False   # pass was off
+        result = li.LegacyInspectionResult(global_wagon_count=len(state.wagons))
+        cam = li.LegacyCameraResult(camera_id=C.CAMERA_RIGHT_UP, flavour="side")
+        cam.payload = payload
+        result.cameras[C.CAMERA_RIGHT_UP] = cam
+
+        applied = li.apply_to_unified(unified, result)
+        self.assertEqual(applied["door"], 0)
+        self.assertEqual(
+            unified["GW_2"].right_door, C.DOOR_OPEN,
+            "a pass that did not run must not overwrite the verdict of the "
+            "implementation that was actually selected")
+
+    def test_active_pass_still_reconciles(self):
+        """The guard must not block the normal path."""
+        from core.unified_wagon_state import UnifiedWagonState
+
+        state = roster(4)
+        seed_cache(self.cache, state, [C.CAMERA_RIGHT_UP])
+        unified = {w.global_id: UnifiedWagonState(global_id=w.global_id)
+                   for w in state.wagons}
+        payload = build_json_for(
+            state, C.CAMERA_RIGHT_UP, self.cache,
+            damage_rows=[side_damage_row(2, door_status="open")])
+        self.assertTrue(payload["inspection_data"]["damage_model_active"])
+        result = li.LegacyInspectionResult(global_wagon_count=len(state.wagons))
+        cam = li.LegacyCameraResult(camera_id=C.CAMERA_RIGHT_UP, flavour="side")
+        cam.payload = payload
+        result.cameras[C.CAMERA_RIGHT_UP] = cam
+
+        li.apply_to_unified(unified, result)
+        self.assertEqual(unified["GW_2"].right_door, C.DOOR_OPEN)
+
+    def test_config_records_which_passes_ran(self):
+        cfg = li.LegacyInspectionConfig(run_side_damage=False)
+        self.assertIs(cfg.to_dict()["run_side_damage"], False)
+        self.assertIs(cfg.to_dict()["run_top_damage"], True)
+
+
+# ---------------------------------------------------------------------------
+# 19. TEST COLLECTION HYGIENE
+# ---------------------------------------------------------------------------
+
+class TestCollectionConfig(unittest.TestCase):
+    """`pytest -q` with no path must run this suite and nothing else.
+
+    The added legacy tree contains `scripts/colab_ocr_gap_wagon_test.py`, which
+    matches pytest's default `*_test.py` pattern and imports tqdm + the OCR
+    stack. Without the config below, collecting it aborts the entire run before
+    any real test executes.
+    """
+
+    def test_pytest_ini_scopes_collection_to_tests(self):
+        path = os.path.join(ROOT, "pytest.ini")
+        self.assertTrue(os.path.isfile(path), "pytest.ini is required")
+        text = open(path, encoding="utf-8").read()
+        self.assertIn("testpaths = tests", text)
+        self.assertIn("rithish__code_1", text)
+
+    def test_the_legacy_tree_is_still_on_disk(self):
+        """It is excluded from collection, NOT deleted -- provenance needs it."""
+        legacy = os.path.join(ROOT, "rithish__code_1")
+        if not os.path.isdir(legacy):
+            self.skipTest("legacy source tree not present")
+        self.assertTrue(os.path.isdir(legacy))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

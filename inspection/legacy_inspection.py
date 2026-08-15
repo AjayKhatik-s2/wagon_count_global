@@ -148,6 +148,35 @@ class LegacyInspectionConfig:
     suppress_floor_damage_on_loaded: bool = True
     min_non_wagon_dominance: float = 0.80
 
+    run_side_damage: bool = True
+    run_top_damage: bool = True
+    """ONE OWNER PER TASK. These are the switch that makes that true.
+
+    Both this layer and ``old_code`` can detect on the same weights over the
+    same cached frames: the side pass and ``old_code/door/processor.py`` both
+    read ``door_state.pt``; the top pass and ``old_code/damage/processor.py``
+    both read ``top_damage.pt``. Running a pair would load one model twice and
+    produce two verdicts for one question -- and whichever was reconciled last
+    would silently win.
+
+    So the runner turns exactly one of each pair on:
+
+        --door-source legacy    (default)  side pass ON,  old_code door OFF
+        --door-source old_code             side pass OFF, old_code door ON
+        top damage                         top pass ON,   old_code damage OFF
+
+    When a pass is off, its cameras still emit their JSON -- the global wagon
+    count must appear in all four files regardless -- but with
+    ``damage_model_active: False``, and every wagon's ``inspection_status``
+    records that the feature did not run rather than that it found nothing.
+    ``apply_to_unified`` reads that same flag, so a disabled pass can never
+    overwrite the verdict of the implementation that was actually selected.
+
+    NOTE on ``--door-source old_code``: the side model is a single 4-class
+    detector, so turning its pass off also gives up SIDE DAMAGE, which
+    ``old_code`` has no equivalent for. That mode is a diagnostic A/B path, not
+    a production one."""
+
     representative_positions: Tuple[float, ...] = (0.25, 0.55, 0.80)
     representative_position_names: Tuple[str, ...] = ("start", "mid1", "end")
     """The legacy wagon evidence contract: 25% / 55% / 80% -> start / mid1 / end."""
@@ -186,6 +215,8 @@ class LegacyInspectionConfig:
             "skip_non_wagon_segments": self.skip_non_wagon_segments,
             "suppress_floor_damage_on_loaded": self.suppress_floor_damage_on_loaded,
             "min_non_wagon_dominance": self.min_non_wagon_dominance,
+            "run_side_damage": self.run_side_damage,
+            "run_top_damage": self.run_top_damage,
             "representative_positions": list(self.representative_positions),
             "representative_position_names": list(self.representative_position_names),
             "models": {"side": self.side_model, "top": self.top_model,
@@ -547,7 +578,11 @@ def _run_camera(
 
     # ---- detection: the LEGACY detector, unchanged --------------------------
     model_rec = models.get(profile.flavour, {})
-    model_ok = model_rec.get("status") == "AVAILABLE"
+    # ONE OWNER PER TASK: a pass that another implementation owns this run does
+    # not execute. See LegacyInspectionConfig.run_side_damage.
+    pass_enabled = (cfg.run_side_damage if profile.is_side
+                    else cfg.run_top_damage)
+    model_ok = pass_enabled and model_rec.get("status") == "AVAILABLE"
     damage_conf = (cfg.damage_confidence_side if profile.is_side
                    else cfg.damage_confidence_top)
 
@@ -569,7 +604,13 @@ def _run_camera(
             flavour=profile.flavour, damage_confidence=damage_conf)
         problem_frames_df = extractor.extract(scan_df, damage_df, work_dir)
     else:
-        if not model_ok:
+        if not pass_enabled:
+            res.warnings.append(
+                f"{profile.flavour} pass disabled: another implementation owns "
+                f"this task for this run, so it is not detected twice. This "
+                f"camera's JSON still lists every global wagon, with "
+                f"damage_model_active=false")
+        elif not model_ok:
             res.warnings.append(
                 f"{profile.flavour} model unavailable "
                 f"({model_rec.get('reason', 'not configured')}) -- every wagon "
@@ -631,7 +672,7 @@ def _run_camera(
                         if str(w.global_id) in by_gid_index}
 
     _annotate_globally(payload, state, scan_df, damage_df, cam_status, profile,
-                       windowed_indices)
+                       windowed_indices, feature_ran=model_ok)
 
     res.payload = payload
     res.wagons_in_json = len(payload["inspection_data"].get("wagon_segments", []))
@@ -656,7 +697,8 @@ def _run_camera(
 
 def _annotate_globally(payload: Dict[str, Any], state: Any, scan_df, damage_df,
                        cam_status: str, profile: gb.CameraProfile,
-                       windowed_indices: Optional[set] = None) -> None:
+                       windowed_indices: Optional[set] = None,
+                       feature_ran: bool = True) -> None:
     """Attach the ADDITIVE global-identity and evidence-status fields.
 
     Everything added here is new-key-only. No legacy key is renamed, removed or
@@ -676,7 +718,12 @@ def _annotate_globally(payload: Dict[str, Any], state: Any, scan_df, damage_df,
         if gid is not None and index is not None:
             by_index[int(index)] = str(gid)
 
-    scanned_ids = {int(s) for s in scan_df["segment_id"]} if len(scan_df) else set()
+    # A wagon counts as scanned only if the model actually ran on it. With the
+    # pass disabled or the weights missing, having cached frames proves nothing
+    # was looked at -- reporting NO_DETECTION there would assert a real negative
+    # finding for a check that never happened.
+    scanned_ids = ({int(s) for s in scan_df["segment_id"]}
+                   if feature_ran and len(scan_df) else set())
     windowed_ids = set(windowed_indices or ())
     damaged_ids: set = set()
     if damage_df is not None and len(damage_df) and "wagon_id" in damage_df.columns:
@@ -774,9 +821,15 @@ def apply_to_unified(unified: Dict[str, Any],
     applied = {"door": 0, "side_damage": 0, "top_damage": 0}
 
     for camera_id, cam_res in (result.cameras or {}).items():
-        segments = (cam_res.payload or {}).get(
-            "inspection_data", {}).get("wagon_segments") or []
-        for seg in segments:
+        data = (cam_res.payload or {}).get("inspection_data", {})
+        # A camera whose pass did not run has nothing to contribute. Skipping it
+        # is what lets `--door-source old_code` work: the side pass is off, so
+        # old_code's DoorTracker verdict stays in `unified` instead of being
+        # overwritten by this layer's legacy defaults. The flag is the payload's
+        # own, so the two can never disagree about whether a model ran.
+        if not data.get("damage_model_active"):
+            continue
+        for seg in data.get("wagon_segments") or []:
             gid = seg.get("global_wagon_id")
             state_obj = unified.get(gid) if gid else None
             if state_obj is None:
